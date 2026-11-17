@@ -626,14 +626,31 @@ class TestCancelOnClientDisconnect:
         assert discarded == (["upstream"] if outcome == "success" else [])
 
     @pytest.mark.asyncio
-    async def test_handler_cancellation_discards_completed_upstream(self):
+    @pytest.mark.parametrize("timing", ["once", "twice", "late_result"])
+    async def test_handler_cancellation_discards_completed_upstream(self, timing):
         discarded = []
+        listening = asyncio.Event()
+        watcher_cancelled = asyncio.Event()
+        cancel_twice = timing != "once"
 
         async def never_disconnects():
-            await asyncio.Event().wait()
+            listening.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if cancel_twice:
+                    watcher_cancelled.set()
+                    await asyncio.Event().wait()
+                raise
 
         async def work():
+            await listening.wait()
             task.cancel()
+            if timing == "late_result":
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    pass
             return "upstream"
 
         task = asyncio.create_task(
@@ -644,8 +661,16 @@ class TestCancelOnClientDisconnect:
                 discard=discarded.append,
             )
         )
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            if cancel_twice:
+                await asyncio.wait_for(watcher_cancelled.wait(), 1)
+                task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         assert discarded == ["upstream"]
 
     @pytest.mark.asyncio

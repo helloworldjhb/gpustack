@@ -599,9 +599,9 @@ async def retry_archive(session, ctx, benchmark, *, run_id=None):
     archive.plan = {**archive.plan, 'repair_scopes': True}
     archive.checkpoint += 1
     session.add(archive)
-    status = await archive_status(session, ctx, benchmark, run_id=archive.run_id)
     await session.commit()
-    return status
+    await session.refresh(archive)
+    return await archive_status(session, ctx, benchmark, run_id=archive.run_id)
 
 
 async def enqueue_archive_deletion(session, benchmark):

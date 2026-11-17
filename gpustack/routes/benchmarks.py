@@ -1587,7 +1587,8 @@ async def update_benchmark_state(
                             message=(
                                 'Benchmark target changed; create a new Benchmark '
                                 'for this deployment.'
-                            )
+                            ),
+                            details={'code': 'benchmark_target_changed'},
                         )
                     snapshot = snapshot.model_copy(
                         update={
@@ -1608,6 +1609,7 @@ async def update_benchmark_state(
         await session.rollback()
         raise
     except Exception as e:
+        await session.rollback()
         raise InternalServerErrorException(
             message=f"Failed to update benchmark state: {e}"
         )

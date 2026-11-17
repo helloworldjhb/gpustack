@@ -12,7 +12,7 @@ from gpustack.monitoring import archive as archive_domain
 from gpustack.routes import benchmarks as routes
 from gpustack.schemas.benchmark import BenchmarkStateEnum
 from gpustack.schemas.benchmark_monitoring import BenchmarkRunEvent
-from gpustack.schemas.principals import OrgRole
+from gpustack.schemas.principals import OrgRole, PrincipalType
 from gpustack.server.deps import get_session
 from tests.routes.test_benchmark_monitoring import api as monitoring_api
 
@@ -47,7 +47,7 @@ def restart(api, monkeypatch):
 
     async def update(benchmark, _session, source, *, auto_commit):
         assert auto_commit is False
-        trace.append(('write-execution', source['run_id']))
+        trace.append(('write-execution', source.get('run_id', benchmark.run_id)))
         for key, value in source.items():
             setattr(benchmark, key, value)
         return benchmark
@@ -125,11 +125,111 @@ def test_changed_generation_restart_rolls_back_result_removal_without_publishing
             json={'state': 'pending', 'run_id': 'previous-run'},
         )
     assert result.status_code == 409
+    assert result.json()['details'] == {'code': 'benchmark_target_changed'}
     restart.write.assert_not_awaited()
     restart.session.commit.assert_not_awaited()
     restart.session.rollback.assert_awaited_once()
     assert restart.ensure.await_count == 1
     assert restart.api.benchmark.run_id == 'previous-run'
+
+
+@pytest.mark.parametrize('failure', ['verification', 'archive', 'commit'])
+def test_restart_failure_rolls_back_the_whole_state_transaction(restart, failure):
+    error = RuntimeError('transaction failed')
+    if failure == 'verification':
+        restart.verify.side_effect = error
+    elif failure == 'archive':
+        restart.ensure.side_effect = [None, error]
+    else:
+        restart.session.commit.side_effect = error
+
+    with TestClient(restart.api.app) as client:
+        result = client.patch(
+            '/v2/benchmarks/7/state',
+            json={'state': 'pending', 'run_id': 'previous-run'},
+        )
+
+    assert result.status_code == 500
+    restart.session.rollback.assert_awaited_once()
+    if failure == 'verification':
+        restart.write.assert_not_awaited()
+    if failure != 'commit':
+        restart.session.commit.assert_not_awaited()
+
+
+@pytest.mark.parametrize('state', ['queued', 'running'])
+def test_worker_state_reports_observe_changed_generation_without_restarting(
+    restart, state
+):
+    restart.api.ctx.user.kind = PrincipalType.SYSTEM
+    restart.api.ctx.scoped_cluster_id = 1
+    restart.api.ctx.scoped_cluster_owner_id = 4
+    restart.api.benchmark.state = (
+        BenchmarkStateEnum.PENDING if state == 'queued' else BenchmarkStateEnum.QUEUED
+    )
+    snapshot = restart.api.benchmark.snapshot.model_copy(deep=True)
+    snapshot.monitoring.events.append(
+        BenchmarkRunEvent(kind='generation_changed', at=1050, model_instance_id=12)
+    )
+    restart.verify.return_value = snapshot
+
+    with TestClient(restart.api.app) as client:
+        result = client.patch(
+            '/v2/benchmarks/7/state',
+            json={'state': state, 'run_id': 'previous-run'},
+        )
+
+    assert result.status_code == 200, result.text
+    assert result.json()['run_id'] == 'previous-run'
+    assert result.json()['state'] == state
+    assert 'run_id' not in restart.write.await_args.args[2]
+    assert restart.api.benchmark.snapshot.monitoring.events[-1].kind == (
+        'generation_changed'
+    )
+    assert restart.ensure.await_count == 1
+    restart.session.commit.assert_awaited_once()
+    restart.session.rollback.assert_not_awaited()
+
+
+def test_stale_worker_state_report_is_fenced_before_restart_work(restart):
+    restart.api.ctx.user.kind = PrincipalType.SYSTEM
+    restart.api.ctx.scoped_cluster_id = 1
+    restart.api.ctx.scoped_cluster_owner_id = 4
+    with TestClient(restart.api.app) as client:
+        result = client.patch(
+            '/v2/benchmarks/7/state',
+            json={'state': 'queued', 'run_id': 'retired-run'},
+        )
+
+    assert result.status_code == 409
+    assert result.json()['details'] == {'code': 'benchmark_run_changed'}
+    restart.write.assert_not_awaited()
+    restart.ensure.assert_not_awaited()
+    restart.verify.assert_not_awaited()
+    restart.session.commit.assert_not_awaited()
+
+
+@pytest.mark.parametrize('denial', ['foreign_owner', 'foreign_cluster', 'member'])
+def test_state_update_authorizes_before_archiving_or_mutating(restart, denial):
+    if denial == 'foreign_owner':
+        restart.api.benchmark.owner_principal_id = 99
+    elif denial == 'foreign_cluster':
+        restart.api.ctx.user.kind = PrincipalType.SYSTEM
+        restart.api.ctx.scoped_cluster_id = 99
+        restart.api.ctx.scoped_cluster_owner_id = 4
+    else:
+        restart.api.ctx.org_role = OrgRole.MEMBER
+    with TestClient(restart.api.app) as client:
+        result = client.patch(
+            '/v2/benchmarks/7/state',
+            json={'state': 'pending', 'run_id': 'previous-run'},
+        )
+
+    assert result.status_code == (403 if denial == 'member' else 404)
+    restart.write.assert_not_awaited()
+    restart.ensure.assert_not_awaited()
+    restart.verify.assert_not_awaited()
+    restart.session.commit.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

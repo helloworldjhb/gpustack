@@ -545,6 +545,15 @@ class TestReconnect:
             pytest.fail(f"client {client_id} did not register {websocket!r}")
         return task
 
+    @staticmethod
+    async def _wait_registered(handler, client_id, websocket):
+        for _ in range(100):
+            manager = handler.connection_managers.get(client_id)
+            if manager is not None and manager.websocket is websocket:
+                return
+            await asyncio.sleep(0.01)
+        pytest.fail(f"client {client_id} did not register {websocket!r}")
+
     @pytest.mark.asyncio
     async def test_late_close_of_replaced_socket_keeps_the_new_route(self):
         # The worker reconnects with the same client_id before the server
@@ -576,7 +585,8 @@ class TestReconnect:
     async def test_reconnect_while_old_socket_is_closing_keeps_the_new_route(self):
         # The previous socket has already released the registration and is
         # still telling peers when the worker reconnects. The new socket's
-        # registration must survive the rest of that cleanup.
+        # registration waits for that cleanup to finish (serialized by the
+        # per-client lock), then installs its route.
         handler = _handler()
         removing = asyncio.Event()
         resume_removal = asyncio.Event()
@@ -595,9 +605,22 @@ class TestReconnect:
         await removing.wait()
 
         new_ws, close_new = _closable_websocket()
-        new_task = await self._connect(handler, worker_id, new_ws)
+        new_task = asyncio.create_task(
+            handler.handle_client_connection(
+                new_ws,
+                RegisteredClientInfo(
+                    client_id=worker_id, cidrs=["10.0.0.5/32"], unix_sockets=[]
+                ),
+            )
+        )
+        # While the remove broadcast is in flight the reconnection has not
+        # registered yet, so peers cannot observe its add before the remove.
+        await asyncio.sleep(0.05)
+        assert worker_id not in handler.connection_managers
+
         resume_removal.set()
         await old_task
+        await self._wait_registered(handler, worker_id, new_ws)
 
         route = handler.get_connection_manager("10.0.0.5")
         assert route is not None and route.websocket is new_ws
@@ -608,10 +631,11 @@ class TestReconnect:
 
     @pytest.mark.asyncio
     async def test_replaced_socket_still_announcing_skips_disconnect_callback(self):
-        # The previous socket is still announcing itself to peers when the
-        # worker reconnects, and the new socket finishes setting up first.
-        # Closing the previous socket must not run the disconnect callback,
-        # which would clear the proxy address of the live connection.
+        # The previous socket is still announcing itself to peers (blocked in
+        # its add broadcast) when the worker reconnects. The reconnection's
+        # registration is serialized behind that announcement; closing the
+        # previous socket must not run the disconnect callback, which would
+        # clear the proxy address of the live connection.
         disconnected = []
 
         async def on_disconnect(server_info, client_info):
@@ -638,9 +662,20 @@ class TestReconnect:
         old_task = await self._connect(handler, worker_id, old_ws)
         await announcing.wait()
         new_ws, close_new = _closable_websocket()
-        new_task = await self._connect(handler, worker_id, new_ws)
+        new_task = asyncio.create_task(
+            handler.handle_client_connection(
+                new_ws,
+                RegisteredClientInfo(
+                    client_id=worker_id, cidrs=["10.0.0.5/32"], unix_sockets=[]
+                ),
+            )
+        )
+        # The reconnection waits behind the in-flight announcement.
+        await asyncio.sleep(0.05)
+        assert handler.connection_managers.get(worker_id).websocket is old_ws
+
         resume_announce.set()
-        await asyncio.sleep(0)
+        await self._wait_registered(handler, worker_id, new_ws)
 
         close_old()
         await old_task

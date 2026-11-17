@@ -6,6 +6,7 @@ Message Client - Client that handles CONNECT_REQUEST from server
 import asyncio
 import logging
 import random
+import time
 import uuid
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
@@ -14,7 +15,9 @@ from gpustack.ssl_context import make_ssl_context
 from .connection_manager import ClientConnectionManager
 from .message import (
     BaseClientInfo,
+    HeartbeatMessage,
     SessionBaseMessage,
+    pack_message,
     parse_message,
 )
 from .authenticator import Authenticator, create_authenticator
@@ -26,6 +29,11 @@ logger = logging.getLogger(__name__)
 INITIAL_RECONNECT_DELAY = 1.0
 MAX_RECONNECT_DELAY = 60.0
 RECONNECT_JITTER_FACTOR = 0.3
+
+# Liveness signal cadence. The server reaps a tunnel whose websocket has
+# been silent past its read timeout once the client has sent at least one
+# heartbeat; keep the interval well below that timeout.
+HEARTBEAT_INTERVAL = 10.0
 
 
 class MessageClient:
@@ -67,6 +75,19 @@ class MessageClient:
                 code=1008, reason="CIDRs updated"
             )  # Trigger reconnect to update server with new CIDRs
 
+    async def _send_heartbeats(self, websocket) -> None:
+        """Keep the liveness signal flowing so the server can reap stale tunnels."""
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                await websocket.send(
+                    pack_message(HeartbeatMessage(timestamp=int(time.time())))
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"[Client] Heartbeat sender stopped: {e}")
+
     async def run(self) -> None:
         """Connect to server and handle incoming messages with automatic reconnect"""
         reconnect_delay = INITIAL_RECONNECT_DELAY
@@ -91,16 +112,22 @@ class MessageClient:
                     f"with client_id: {self._client_info.client_id}"
                 )
                 connection_manager = ClientConnectionManager(self._websocket)
+                heartbeat_task = asyncio.create_task(
+                    self._send_heartbeats(self._websocket)
+                )
                 reconnect_delay = (
                     INITIAL_RECONNECT_DELAY  # Reset delay on successful connection
                 )
 
-                async for raw_data in self._websocket:
-                    msg = parse_message(raw_data)
-                    logger.trace(f"[Client] Received: {msg.get_type()}")
+                try:
+                    async for raw_data in self._websocket:
+                        msg = parse_message(raw_data)
+                        logger.trace(f"[Client] Received: {msg.get_type()}")
 
-                    if isinstance(msg, SessionBaseMessage):
-                        await connection_manager.dispatch(msg)
+                        if isinstance(msg, SessionBaseMessage):
+                            await connection_manager.dispatch(msg)
+                finally:
+                    heartbeat_task.cancel()
 
             except ConnectionClosed:
                 # Suppress ConnectionClosed - reconnect automatically

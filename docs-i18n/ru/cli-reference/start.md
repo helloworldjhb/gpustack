@@ -150,6 +150,28 @@ gpustack start [OPTIONS]
 | `--benchmark-dir` значение                  | `<data-dir>/benchmarks`                | Каталог хранения результатов бенчмарков. |
 | `--benchmark-max-duration-seconds` значение | (пусто)                                | Максимальная длительность бенчмарка до тайм-аута. Пустое значение отключает ограничение. |
 
+### Параметры хранилища артефактов { #artifact-storage-options }
+
+Хранилище архивов мониторинга Benchmark настраивается следующими флагами, переменными `GPUSTACK_` или YAML-ключами с подчёркиваниями.
+
+`builtin` использует одноузловой SeaweedFS внутри готового контейнера Server; `external` подключает существующий S3-совместимый бакет; `disabled` останавливает новые записи. Worker не требуется локальное объектное хранилище.
+
+| Флаг | По умолчанию | Назначение |
+| --- | --- | --- |
+| `--artifact-storage-mode` | - | Режим: `builtin` для готового контейнера Server, `disabled` для исходников или wheel. |
+| `--artifact-storage-profile-id` | `default` | Постоянный идентификатор места хранения. |
+| `--artifact-storage-endpoint` | - | Адрес S3; можно опустить для стандартного определения адреса AWS. |
+| `--artifact-storage-bucket` | `gpustack-artifacts` | Существующий бакет во внешнем режиме. |
+| `--artifact-storage-prefix` | `gpustack` | Префикс ключей объектов. |
+| `--artifact-storage-region` | `us-east-1` | Регион S3. |
+| `--artifact-storage-addressing-style` | `auto` | Стиль адресации: `auto`, `path` или `virtual`. |
+| `--artifact-storage-tls-verify` | `true` | Проверка TLS; явное отключение: `--no-artifact-storage-tls-verify`. |
+| `--artifact-storage-max-total-bytes` | `0` | Начальный глобальный лимит в байтах; `0` означает отсутствие ограничения. |
+
+Передавайте учётные данные через защищённый YAML или `GPUSTACK_ARTIFACT_STORAGE_ACCESS_KEY_ID`, `GPUSTACK_ARTIFACT_STORAGE_SECRET_ACCESS_KEY` и необязательный `GPUSTACK_ARTIFACT_STORAGE_SESSION_TOKEN`. Иначе используется цепочка SDK. `artifact_storage_read_profiles` задаётся через YAML или JSON-переменную `GPUSTACK_ARTIFACT_STORAGE_READ_PROFILES`.
+
+Тайм-ауты, сроки хранения, исторические профили чтения, manifest и команды обслуживания описаны в разделе [Хранилище артефактов](../user-guide/artifact-storage.md).
+
 ### Доступные переменные среды { #available-environment-variables }
 
 Большинство параметров командной строки также можно задать переменными среды с префиксом `GPUSTACK_`, записанными

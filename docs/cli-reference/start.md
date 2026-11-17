@@ -149,6 +149,28 @@ gpustack start [OPTIONS]
 | `--benchmark-dir` value                  | `<data-dir>/benchmarks`                | Directory to store benchmark results.                                                                                                                                                        |
 | `--benchmark-max-duration-seconds` value | (empty)                                | Max duration for a benchmark before timeout. Disabled when empty.                                                                                                                            |
 
+### Artifact Storage Options
+
+Configure object storage for Benchmark monitoring archives with these flags, the corresponding `GPUSTACK_` environment variables, or YAML keys with underscores.
+
+`builtin` uses the single-node SeaweedFS bundled in the packaged Server container; `external` connects to an existing S3-compatible bucket; `disabled` stops new writes. Workers do not need a local object store.
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--artifact-storage-mode` | - | Storage mode; packaged Servers default to `builtin`, source/wheel installs to `disabled`. |
+| `--artifact-storage-profile-id` | `default` | Stable identifier for this storage destination. |
+| `--artifact-storage-endpoint` | - | S3 endpoint; omit for AWS endpoint discovery. |
+| `--artifact-storage-bucket` | `gpustack-artifacts` | Existing bucket in external mode. |
+| `--artifact-storage-prefix` | `gpustack` | Object key prefix. |
+| `--artifact-storage-region` | `us-east-1` | S3 region. |
+| `--artifact-storage-addressing-style` | `auto` | S3 addressing style: `auto`, `path`, or `virtual`. |
+| `--artifact-storage-tls-verify` | `true` | Verify TLS certificates; explicitly disable with `--no-artifact-storage-tls-verify`. |
+| `--artifact-storage-max-total-bytes` | `0` | Initial global byte limit; `0` means unlimited. |
+
+Supply credentials through protected YAML settings or `GPUSTACK_ARTIFACT_STORAGE_ACCESS_KEY_ID`, `GPUSTACK_ARTIFACT_STORAGE_SECRET_ACCESS_KEY`, and optional `GPUSTACK_ARTIFACT_STORAGE_SESSION_TOKEN`. Without explicit credentials, the SDK credential chain is used. Configure `artifact_storage_read_profiles` through YAML or the JSON environment variable `GPUSTACK_ARTIFACT_STORAGE_READ_PROFILES`.
+
+For timeouts, retention, historical read profiles, manifests, and maintenance commands, see [Artifact Storage](../user-guide/artifact-storage.md).
+
 ### Available Environment Variables
 
 Most command line parameters can also be set via environment variables with the `GPUSTACK_` prefix and in uppercase

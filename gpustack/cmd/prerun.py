@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import logging
+import shlex
 from pathlib import Path
 from shutil import move
 from typing import List, Dict
@@ -25,6 +26,7 @@ from gpustack.utils.s6_services import (
     postgres_services,
     migration_services,
     observability_services,
+    artifact_storage_services,
     all_services,
     gpustack_service_name,
 )
@@ -77,6 +79,8 @@ def run(args: argparse.Namespace):
             prepare_gateway_config(cfg)
         if use_builtin_grafana(cfg):
             prepare_observability_config(cfg)
+        if use_builtin_artifact_storage(cfg):
+            prepare_artifact_storage_config(cfg)
         logger.info("Pre-run checks and setup completed successfully.")
     except Exception as e:
         logger.fatal(f"Failed to pre-check the configuration: {e}")
@@ -114,6 +118,9 @@ def ports_for_services(cfg: Config) -> Dict[int, str]:
     # when gateway is disabled, api port is not required
     if not gateway_disabled:
         ports[cfg.api_port] = gpustack_service_name
+
+    if use_builtin_artifact_storage(cfg):
+        artifact_storage_services.set_ports(cfg, ports)
 
     return ports
 
@@ -417,7 +424,32 @@ def determine_enabled_services(cfg: Config) -> List[str]:
     if use_builtin_grafana(cfg):
         services.extend(observability_services.all_services())
 
+    if use_builtin_artifact_storage(cfg):
+        services.extend(artifact_storage_services.all_services())
+
     return services
+
+
+def use_builtin_artifact_storage(cfg: Config) -> bool:
+    return cfg.artifact_storage_mode == 'builtin' and cfg.server_role() in (
+        Config.ServerRole.SERVER,
+        Config.ServerRole.BOTH,
+    )
+
+
+def prepare_artifact_storage_config(cfg: Config):
+    from gpustack.artifacts.builtin import prepare_builtin
+
+    prepare_builtin(cfg)
+    config_path = prepare_env('GPUSTACK_ARTIFACT_STORAGE_CONFIG', 'artifact-storage')
+    values = {
+        'ARTIFACT_STORAGE_DIR': os.path.join(cfg.data_dir, 'artifacts', 'builtin'),
+        'ARTIFACT_STORAGE_PORT': cfg.artifact_storage_builtin_port,
+        'LOG_DIR': cfg.log_dir,
+    }
+    config_path.write_text(
+        ''.join(f'{key}={shlex.quote(str(value))}\n' for key, value in values.items())
+    )
 
 
 def use_builtin_grafana(cfg: Config) -> bool:
@@ -443,6 +475,9 @@ def determine_dependency_services(cfg: Config) -> List[str]:
         # embedded database
         if cfg.database_url is None:
             dependencies.extend(postgres_services.dep_services)
+
+        if use_builtin_artifact_storage(cfg):
+            dependencies.extend(artifact_storage_services.dep_services)
 
         # migration
         old_db_file = Path(cfg.data_dir) / "database.db"

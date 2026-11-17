@@ -53,6 +53,7 @@ nav_translations:
   Single Sign-On (SSO) Authentication: Аутентификация с помощью единого входа (SSO)
   Observability: Наблюдаемость
   Benchmarking: Бенчмаркинг
+  Artifact Storage: Хранилище артефактов
   Using Models: Использование моделей
   Using Large Language Models: Использование больших языковых моделей
   Using Vision Language Models: Использование визуально-языковых моделей

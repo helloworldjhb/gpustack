@@ -1,0 +1,10 @@
+#!/command/with-contenv /bin/bash
+# shellcheck shell=bash
+# shellcheck disable=SC1091,SC1090
+set -o errexit -o nounset -o pipefail
+source "${GPUSTACK_ARTIFACT_STORAGE_CONFIG:-/run/gpustack/artifact-storage/.env}"
+SERVICE_LOG_DIR="${LOG_DIR}/seaweedfs"
+mkdir -p "$SERVICE_LOG_DIR"
+chown 65534:65534 "$SERVICE_LOG_DIR"
+chmod 755 "$SERVICE_LOG_DIR"
+exec logutil-service "$SERVICE_LOG_DIR"

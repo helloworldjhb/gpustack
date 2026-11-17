@@ -98,6 +98,7 @@ plugins:
       'installation/iluvatar/installation.md': 'installation/requirements.md'
       'installation/cambricon/installation.md': 'installation/requirements.md'
       'installation/metax/installation.md': 'installation/requirements.md'
+      'installation/artifact-storage.md': 'user-guide/artifact-storage.md'
   minify:
     minify_html: true
     minify_css: true
@@ -215,6 +216,7 @@ nav:
           - Single Sign-On (SSO) Authentication: user-guide/sso.md
           - Observability: user-guide/observability.md
           - Benchmarking: user-guide/benchmarking.md
+          - Artifact Storage: user-guide/artifact-storage.md
       - Using Models:
           - Using Large Language Models: using-models/using-large-language-models.md
           - Using Vision Language Models: using-models/using-vision-language-models.md

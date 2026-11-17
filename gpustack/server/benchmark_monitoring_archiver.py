@@ -413,11 +413,14 @@ class BenchmarkMonitoringArchiver:
                     and _value(benchmark.state) not in _TERMINAL
                 ):
                     continue
-                await ensure_archive_for_benchmark(session, benchmark)
-            try:
-                await session.commit()
-            except IntegrityError:
-                await session.rollback()
+                try:
+                    async with session.begin_nested():
+                        await ensure_archive_for_benchmark(session, benchmark)
+                        # Keep insert races inside this candidate's savepoint.
+                        await session.flush()
+                except IntegrityError:
+                    continue
+            await session.commit()
 
     async def claim(self, archive_id):
         now = time.time()

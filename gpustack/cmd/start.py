@@ -736,6 +736,71 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         "Default value is direct for embedded worker, and worker for standalone worker.",
     )
 
+    artifact_group = parser_server.add_argument_group("Artifact storage settings")
+    for name in (
+        'mode',
+        'profile_id',
+        'endpoint',
+        'bucket',
+        'prefix',
+        'region',
+        'access_key_id',
+        'secret_access_key',
+        'session_token',
+        'ca_file',
+        'addressing_style',
+    ):
+        artifact_group.add_argument(
+            '--artifact-storage-' + name.replace('_', '-'),
+            type=str,
+            default=get_gpustack_env('ARTIFACT_STORAGE_' + name.upper()),
+            help='Artifact storage ' + name.replace('_', ' ') + '.',
+        )
+    for name in (
+        'max_connections',
+        'max_concurrency',
+        'max_attempts',
+        'max_object_bytes',
+        'builtin_port',
+        'max_total_bytes',
+    ):
+        artifact_group.add_argument(
+            '--artifact-storage-' + name.replace('_', '-'),
+            type=int,
+            default=get_gpustack_env('ARTIFACT_STORAGE_' + name.upper()),
+        )
+    for name in ('connect_timeout', 'read_timeout'):
+        artifact_group.add_argument(
+            '--artifact-storage-' + name.replace('_', '-'),
+            type=float,
+            default=get_gpustack_env('ARTIFACT_STORAGE_' + name.upper()),
+        )
+    artifact_group.add_argument(
+        '--artifact-storage-tls-verify',
+        action=argparse.BooleanOptionalAction,
+        default=get_gpustack_env_bool('ARTIFACT_STORAGE_TLS_VERIFY'),
+        help='Verify artifact S3 TLS certificates (enabled by default).',
+    )
+    artifact_group.add_argument(
+        '--artifact-storage-conditional-writes',
+        action=argparse.BooleanOptionalAction,
+        default=get_gpustack_env_bool('ARTIFACT_STORAGE_CONDITIONAL_WRITES'),
+        help='Use conditional S3 creation when supported (enabled by default).',
+    )
+    for name in (
+        'retention_days',
+        'sample_step_seconds',
+        'flush_interval_seconds',
+        'settle_seconds',
+        'max_concurrency',
+        'max_run_bytes',
+    ):
+        artifact_group.add_argument(
+            '--benchmark-archive-' + name.replace('_', '-'),
+            type=int,
+            default=get_gpustack_env('BENCHMARK_ARCHIVE_' + name.upper()),
+        )
+
     # Allow plugins to set up start command arguments
     _setup_plugin_start_args(parser_server)
 
@@ -903,6 +968,9 @@ def set_common_options(args, config_data: dict):
 
 
 def set_server_options(args, config_data: dict):
+    for option in Config.model_fields:
+        if option.startswith(('artifact_storage_', 'benchmark_archive_')):
+            set_config_option(args, config_data, option)
     options = [
         "metrics_port",
         "database_port",

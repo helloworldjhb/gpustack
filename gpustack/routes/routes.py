@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Request
 
 from gpustack.routes import (
     api_keys,
+    artifact_storage,
     auth,
     cache_providers,
     cacerts,
@@ -41,6 +42,7 @@ from gpustack.routes import (
     workers,
     usage,
     resource_usage,
+    resource_monitoring,
     cloud_credentials,
     worker_pools,
     clusters,
@@ -357,6 +359,7 @@ worker_client_router.add_api_route(
 # Tenant-aware routers: any logged-in user can hit them; the handlers
 # filter by TenantContext (owner_principal_id / cluster visibility).
 tenant_routers = model_routers + [
+    {"router": resource_monitoring.router, "tags": ["Resource Monitoring"]},
     {
         "router": model_revisions.router,
         "prefix": "/models",
@@ -439,6 +442,11 @@ tenant_routers = model_routers + [
 
 # Platform-only routers — admin can manage globally; non-admin gets 403.
 admin_routers = [
+    {
+        'router': artifact_storage.router,
+        'prefix': '/artifact-storage',
+        'tags': ['Artifact Storage'],
+    },
     {"router": users.router, "prefix": "/users", "tags": ["Users"]},
     {
         "router": organizations.router,

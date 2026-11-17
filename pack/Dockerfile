@@ -30,6 +30,7 @@ ARG HIGRESS_VERSION=2.1.9
 ARG HIGRESS_APISERVER_VERSION=0.0.26
 ARG PROMETHEUS_VERSION=3.5.1
 ARG GRAFANA_VERSION=12.2.4
+ARG SEAWEEDFS_VERSION=4.54
 
 # Stage Base
 #
@@ -349,6 +350,27 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 ARG TARGETPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
+ARG SEAWEEDFS_VERSION
+
+# Enable builtin artifact storage by default in the packaged server.
+ENV GPUSTACK_PACKAGED=1
+
+## Install the pinned single-node artifact S3 service (amd64 and arm64).
+# SHA-256 values are the release asset digests published by SeaweedFS.
+RUN <<EOF
+    case "${TARGETARCH}" in
+        amd64) SEAWEEDFS_SHA256=e7424a82eee327809bfa449fda4924c9a0f42f6669a01288eebb1b79674c8196 ;;
+        arm64) SEAWEEDFS_SHA256=e4eeae433dc6f5111034b8b1cc0c1a08b9b094b4eea101a36650ddc3a7c0ce58 ;;
+        *) echo "Unsupported SeaweedFS architecture: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    curl --retry 3 --retry-connrefused -fL \
+        "https://github.com/seaweedfs/seaweedfs/releases/download/${SEAWEEDFS_VERSION}/linux_${TARGETARCH}.tar.gz" \
+        -o /tmp/seaweedfs.tar.gz
+    echo "${SEAWEEDFS_SHA256}  /tmp/seaweedfs.tar.gz" | sha256sum -c -
+    tar -xzf /tmp/seaweedfs.tar.gz -C /usr/local/bin weed
+    chmod 755 /usr/local/bin/weed
+    rm /tmp/seaweedfs.tar.gz
+EOF
 
 ## Configure data volume
 VOLUME /var/lib/gpustack

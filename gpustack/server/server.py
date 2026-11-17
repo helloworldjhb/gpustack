@@ -266,6 +266,7 @@ class Server:
         self._coordinator = None
         self._leader_election_task = None
         self._leader_ai_proxy_cleanup_task = None
+        self._benchmark_monitoring_archiver_task = None
 
     @property
     def all_processes(self):
@@ -1536,6 +1537,7 @@ class Server:
             logger.debug("Using LocalCoordinator")
 
         self._coordinator = coordinator
+        self._validate_archive_coordinator()
         await self._coordinator.start()
 
         for ctx in getattr(app.state, "plugin_contexts", {}).values():
@@ -1628,6 +1630,30 @@ class Server:
             "or set the GPUSTACK_JWT_SECRET_KEY environment variable."
         )
 
+    def _validate_archive_coordinator(self):
+        if getattr(
+            self._config, 'artifact_storage_mode', 'disabled'
+        ) == 'builtin' and not isinstance(self._coordinator, LocalCoordinator):
+            raise RuntimeError(
+                'Multi-Server deployments require a shared S3 endpoint. Configure '
+                'external artifact storage, including for an installer-managed '
+                'SeaweedFS cluster.'
+            )
+
+    def _start_benchmark_monitoring_archiver(self):
+        if getattr(self._config, 'artifact_storage_mode', 'disabled') == 'disabled':
+            return
+        task = self._benchmark_monitoring_archiver_task
+        if task is not None and not task.done():
+            return
+        from gpustack.server.benchmark_monitoring_archiver import (
+            BenchmarkMonitoringArchiver,
+        )
+
+        self._benchmark_monitoring_archiver_task = self._create_async_task(
+            BenchmarkMonitoringArchiver(self._config).run()
+        )
+
     async def _start_leader_only_tasks(self):
         """Start tasks that should only run on the Leader instance."""
         if isinstance(self._coordinator, LocalCoordinator):
@@ -1694,6 +1720,10 @@ class Server:
 
         # Controllers
         self._start_controllers()
+
+        # Archive progress and leases live in the shared database so a new
+        # leader can continue without the previous Server's local files.
+        self._start_benchmark_monitoring_archiver()
 
         # Extension plugins' leader-only tasks (reconcilers that need a
         # single writer). Same lifecycle as the tasks above: started on

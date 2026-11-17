@@ -17,7 +17,14 @@ from gpustack_runtime.detector import (
     available_manufacturers,
     available_backends,
 )
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from gpustack.utils import validators
 from gpustack.schemas.workers import (
@@ -63,6 +70,7 @@ from gpustack.utils.file import (
     write_credential_file,
 )
 from gpustack.utils import platform
+from gpustack.artifacts.config import ArtifactStorageProfile
 
 _config = None
 
@@ -377,6 +385,55 @@ class Config(WorkerConfig, BaseSettings):
     grafana_pd_dashboard_uid: Optional[str] = "gpustack-pd"
     grafana_cache_service_dashboard_uid: Optional[str] = "gpustack-cache-service"
 
+    # Packaged single-server installations include a local S3 service. Workers
+    # and source/wheel installations remain usable without that process.
+    artifact_storage_mode: Literal['builtin', 'external', 'disabled'] = Field(
+        default_factory=lambda: (
+            'builtin' if os.getenv('GPUSTACK_PACKAGED') == '1' else 'disabled'
+        )
+    )
+    artifact_storage_profile_id: str = 'default'
+    artifact_storage_endpoint: Optional[str] = None
+    artifact_storage_bucket: str = 'gpustack-artifacts'
+    artifact_storage_prefix: str = 'gpustack'
+    artifact_storage_region: str = 'us-east-1'
+    artifact_storage_access_key_id: Optional[SecretStr] = Field(
+        default=None, exclude=True, repr=False
+    )
+    artifact_storage_secret_access_key: Optional[SecretStr] = Field(
+        default=None, exclude=True, repr=False
+    )
+    artifact_storage_session_token: Optional[SecretStr] = Field(
+        default=None, exclude=True, repr=False
+    )
+    artifact_storage_ca_file: Optional[str] = None
+    artifact_storage_tls_verify: bool = True
+    artifact_storage_addressing_style: Literal['auto', 'path', 'virtual'] = 'auto'
+    artifact_storage_conditional_writes: bool = True
+    artifact_storage_connect_timeout: float = Field(default=5, gt=0, le=120)
+    artifact_storage_read_timeout: float = Field(default=30, gt=0, le=300)
+    artifact_storage_max_connections: int = Field(default=8, ge=1, le=128)
+    artifact_storage_max_concurrency: int = Field(default=4, ge=1, le=64)
+    artifact_storage_max_attempts: int = Field(default=3, ge=1, le=10)
+    artifact_storage_max_object_bytes: int = Field(
+        default=16 * 1024 * 1024, ge=1, le=256 * 1024 * 1024
+    )
+    artifact_storage_read_profiles: Dict[str, ArtifactStorageProfile] = Field(
+        default_factory=dict, exclude=True, repr=False
+    )
+    artifact_storage_builtin_port: int = Field(default=18333, ge=1024, le=65535)
+    # Seed the shared database policy once; administrators can change it online.
+    # Zero keeps the installation unlimited.
+    artifact_storage_max_total_bytes: int = Field(default=0, ge=0, le=9007199254740991)
+
+    # Archive retention follows the Benchmark unless an administrator sets days.
+    benchmark_archive_retention_days: Optional[int] = Field(default=None, ge=1)
+    benchmark_archive_sample_step_seconds: int = Field(default=15, ge=1)
+    benchmark_archive_flush_interval_seconds: int = Field(default=60, ge=1)
+    benchmark_archive_settle_seconds: int = Field(default=30, ge=0)
+    benchmark_archive_max_concurrency: int = Field(default=2, ge=1, le=32)
+    benchmark_archive_max_run_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
+
     # Server-wide default for the GPUStack Operator image. Cluster-level
     # ``k8s_options.operator_image`` overrides this when set.
     operator_image: str = f"gpustack/gpustack-operator:{__operator_version__}"
@@ -397,11 +454,16 @@ class Config(WorkerConfig, BaseSettings):
     _data_dir_was_fresh = False
 
     model_config = SettingsConfigDict(
-        env_prefix="GPUSTACK_", protected_namespaces=('settings_',), extra="allow"
+        env_prefix="GPUSTACK_",
+        protected_namespaces=('settings_',),
+        extra="allow",
+        hide_input_in_errors=True,
     )
 
     def __init__(self, **values):
         super().__init__(**values)
+        if self.server_url and 'artifact_storage_mode' not in self.model_fields_set:
+            self.artifact_storage_mode = 'disabled'
         self._set_worker_fields = self.model_dump(
             exclude_defaults=True,
             exclude_unset=True,
@@ -513,6 +575,29 @@ class Config(WorkerConfig, BaseSettings):
                     f'Invalid CIDR network "{cidr}" in trusted_proxy_cidrs.'
                 )
         return value
+
+    @model_validator(mode="after")
+    def validate_artifact_storage(self):
+        # Reject malformed endpoints before they can reach an SDK exception or
+        # an exported config. Validation errors never include credential input.
+        if self.artifact_storage_mode != 'disabled':
+            try:
+                ArtifactStorageProfile.model_validate(
+                    {
+                        name: getattr(self, 'artifact_storage_' + name)
+                        for name in ArtifactStorageProfile.model_fields
+                    }
+                )
+            except ValueError:
+                raise ValueError('Invalid artifact storage configuration.') from None
+        if (
+            self.artifact_storage_mode == 'builtin'
+            and self.artifact_storage_endpoint is not None
+            and self.artifact_storage_endpoint
+            != f'http://127.0.0.1:{self.artifact_storage_builtin_port}'
+        ):
+            raise ValueError('Builtin artifact storage requires its loopback endpoint.')
+        return self
 
     @model_validator(mode="after")
     def check_all(self):  # noqa: C901

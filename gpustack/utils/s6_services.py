@@ -54,14 +54,15 @@ class S6Services:
             return
         for service, port_list in self.service_port_getters.items():
             for port_or_field in port_list:
-                if isinstance(port_or_field, int):
-                    ports[port_or_field] = service
-                else:
-                    port_value = getattr(config, port_or_field, None)
-                    if port_value is None or not isinstance(port_value, int):
-                        continue
-                    if not port_conflict(port_value, ports):
-                        ports[port_value] = service
+                port_value = (
+                    port_or_field
+                    if isinstance(port_or_field, int)
+                    else getattr(config, port_or_field, None)
+                )
+                if port_value is None or not isinstance(port_value, int):
+                    continue
+                if not port_conflict(port_value, ports):
+                    ports[port_value] = service
 
     @property
     def dep_services(self) -> List[str]:
@@ -87,6 +88,14 @@ observability_services = S6Services(
     S6Service("prometheus", ["builtin_prometheus_port"]),
     support_pipeline=True,
 )
+artifact_storage_services = S6Services(
+    S6Service(
+        "seaweedfs",
+        ["artifact_storage_builtin_port", 19333, 18080, 18888, 29333, 28080, 28888],
+    ),
+    S6Service("artifact-storage-init", [], True, False),
+    support_pipeline=True,
+)
 
 
 def all_services() -> List[str]:
@@ -95,6 +104,7 @@ def all_services() -> List[str]:
         *postgres_services.all_services(),
         *migration_services.all_services(),
         *observability_services.all_services(),
+        *artifact_storage_services.all_services(),
     ]
 
 

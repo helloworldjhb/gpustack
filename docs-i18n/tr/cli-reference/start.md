@@ -150,6 +150,28 @@ gpustack start [OPTIONS]
 | `--benchmark-dir` değer                  | `<data-dir>/benchmarks`                | Benchmark sonuçlarının saklanacağı dizin. |
 | `--benchmark-max-duration-seconds` değer | (boş)                                | Zaman aşımından önceki en uzun benchmark süresi. Boşsa devre dışıdır. |
 
+### Artefakt depolama seçenekleri { #artifact-storage-options }
+
+Benchmark izleme arşivlerinin nesne depolamasını aşağıdaki bayraklarla, karşılık gelen `GPUSTACK_` ortam değişkenleriyle veya alt çizgili YAML anahtarlarıyla yapılandırın.
+
+`builtin`, paketlenmiş Server konteynerindeki tek düğümlü SeaweedFS hizmetini; `external`, mevcut S3 uyumlu bucket hizmetini kullanır. `disabled` yeni yazmaları durdurur. Worker yerel nesne depolamasına ihtiyaç duymaz.
+
+| Bayrak | Varsayılan | Amaç |
+| --- | --- | --- |
+| `--artifact-storage-mode` | - | Mod: paketlenmiş Server için `builtin`, kaynak veya wheel kurulumu için `disabled`. |
+| `--artifact-storage-profile-id` | `default` | Depolama hedefinin kalıcı kimliği. |
+| `--artifact-storage-endpoint` | - | S3 uç noktası; AWS varsayılan keşfi için atlanabilir. |
+| `--artifact-storage-bucket` | `gpustack-artifacts` | Harici modda mevcut bucket. |
+| `--artifact-storage-prefix` | `gpustack` | Nesne anahtarı öneki. |
+| `--artifact-storage-region` | `us-east-1` | S3 bölgesi. |
+| `--artifact-storage-addressing-style` | `auto` | Adresleme stili: `auto`, `path` veya `virtual`. |
+| `--artifact-storage-tls-verify` | `true` | TLS doğrulaması; açıkça kapatmak için `--no-artifact-storage-tls-verify`. |
+| `--artifact-storage-max-total-bytes` | `0` | Başlangıç genel sınırı, bayt; `0` sınırsızdır. |
+
+Kimlik bilgilerini korunan YAML veya `GPUSTACK_ARTIFACT_STORAGE_ACCESS_KEY_ID`, `GPUSTACK_ARTIFACT_STORAGE_SECRET_ACCESS_KEY` ve isteğe bağlı `GPUSTACK_ARTIFACT_STORAGE_SESSION_TOKEN` ile sağlayın. Aksi halde SDK kimlik bilgisi zinciri kullanılır. `artifact_storage_read_profiles`, YAML veya `GPUSTACK_ARTIFACT_STORAGE_READ_PROFILES` JSON ortam değişkeniyle ayarlanır.
+
+Zaman aşımları, saklama süresi, geçmiş okuma profilleri, manifest ve bakım komutları için [Artefakt Depolama](../user-guide/artifact-storage.md) bölümüne bakın.
+
 ### Kullanılabilir ortam değişkenleri { #available-environment-variables }
 
 Komut satırı parametrelerinin çoğu, `GPUSTACK_` öneki eklenerek ve adları büyük harfle

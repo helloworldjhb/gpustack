@@ -53,6 +53,8 @@ dependencies = [
     "asyncmy>=0.2.12",
     "pymysql>=1.1.1",
     "blobfile>=3.0.0",
+    "boto3>=1.36.0,<2.0.0",
+    "botocore>=1.36.0,<2.0.0",
     "aiolimiter>=1.2.1",
     "python3-saml==1.16.0",
     "lxml>=6.0.2",

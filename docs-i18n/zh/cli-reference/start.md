@@ -150,6 +150,28 @@ gpustack start [OPTIONS]
 | `--benchmark-dir` value                  | `<data-dir>/benchmarks`                | 基准测试结果存储目录。                                                                                                                                                        |
 | `--benchmark-max-duration-seconds` value | (empty)                                | 基准测试超时前的最长运行时间。为空时不限制。                                                                                                                            |
 
+### 制品存储选项 { #artifact-storage-options }
+
+使用以下参数、对应的 `GPUSTACK_` 环境变量，或使用下划线键名的 YAML 配置，设置 Benchmark 监控归档的对象存储。
+
+`builtin` 使用 Server 容器内置的单机 SeaweedFS；`external` 连接已有的 S3 兼容 bucket；`disabled` 停止新增写入。Worker 无需启动本地对象存储。
+
+| 参数 | 默认值 | 用途 |
+| --- | --- | --- |
+| `--artifact-storage-mode` | - | 存储模式；打包的 Server 容器默认为 `builtin`，源码或 wheel 安装默认为 `disabled`。 |
+| `--artifact-storage-profile-id` | `default` | 此存储目标的固定标识。 |
+| `--artifact-storage-endpoint` | - | S3 地址；使用 AWS 默认地址发现时可省略。 |
+| `--artifact-storage-bucket` | `gpustack-artifacts` | 外置模式下已存在的 bucket。 |
+| `--artifact-storage-prefix` | `gpustack` | 对象键前缀。 |
+| `--artifact-storage-region` | `us-east-1` | S3 区域。 |
+| `--artifact-storage-addressing-style` | `auto` | S3 地址风格：`auto`、`path` 或 `virtual`。 |
+| `--artifact-storage-tls-verify` | `true` | 验证 TLS 证书；可通过 `--no-artifact-storage-tls-verify` 显式关闭。 |
+| `--artifact-storage-max-total-bytes` | `0` | 初始全局容量上限，单位为字节；`0` 表示无限制。 |
+
+访问凭证通过受保护的 YAML 配置，或 `GPUSTACK_ARTIFACT_STORAGE_ACCESS_KEY_ID`、`GPUSTACK_ARTIFACT_STORAGE_SECRET_ACCESS_KEY` 及可选的 `GPUSTACK_ARTIFACT_STORAGE_SESSION_TOKEN` 提供。未显式配置时使用 SDK 凭证链。`artifact_storage_read_profiles` 通过 YAML 或 JSON 环境变量 `GPUSTACK_ARTIFACT_STORAGE_READ_PROFILES` 配置。
+
+超时、归档保留、历史读取配置、manifest 和维护命令，见[制品存储](../user-guide/artifact-storage.md)。
+
 ### 可用环境变量 { #available-environment-variables }
 
 大多数命令行参数也可通过带有 `GPUSTACK_` 前缀的全大写环境变量

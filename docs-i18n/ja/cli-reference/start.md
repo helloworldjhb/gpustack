@@ -150,6 +150,28 @@ gpustack start [OPTIONS]
 | `--benchmark-dir` 値                  | `<data-dir>/benchmarks`                | ベンチマーク結果を保存するディレクトリー。 |
 | `--benchmark-max-duration-seconds` 値 | （空）                                | ベンチマークがタイムアウトするまでの最大時間。空の場合は無効です。 |
 
+### アーティファクトストレージのオプション { #artifact-storage-options }
+
+Benchmark の監視アーカイブ用ストレージは、以下のフラグ、対応する `GPUSTACK_` 環境変数、またはアンダースコア区切りの YAML キーで設定します。
+
+`builtin` はパッケージ版 Server コンテナ内の単一ノード SeaweedFS、`external` は既存の S3 互換バケットを使用します。`disabled` は新規書き込みを停止します。Worker にローカルストレージは不要です。
+
+| フラグ | 既定値 | 用途 |
+| --- | --- | --- |
+| `--artifact-storage-mode` | - | モード。パッケージ版 Server は `builtin`、ソースまたは wheel は `disabled` が既定です。 |
+| `--artifact-storage-profile-id` | `default` | 保存先を識別する固定 ID。 |
+| `--artifact-storage-endpoint` | - | S3 エンドポイント。AWS の既定エンドポイント検出時は省略できます。 |
+| `--artifact-storage-bucket` | `gpustack-artifacts` | 外部モードの既存バケット。 |
+| `--artifact-storage-prefix` | `gpustack` | オブジェクトキーのプレフィックス。 |
+| `--artifact-storage-region` | `us-east-1` | S3 リージョン。 |
+| `--artifact-storage-addressing-style` | `auto` | S3 アドレス形式：`auto`、`path`、`virtual`。 |
+| `--artifact-storage-tls-verify` | `true` | TLS 証明書を検証します。明示的な無効化は `--no-artifact-storage-tls-verify`。 |
+| `--artifact-storage-max-total-bytes` | `0` | 初期グローバル容量上限（バイト）。`0` は無制限。 |
+
+認証情報は保護された YAML、または `GPUSTACK_ARTIFACT_STORAGE_ACCESS_KEY_ID`、`GPUSTACK_ARTIFACT_STORAGE_SECRET_ACCESS_KEY`、任意の `GPUSTACK_ARTIFACT_STORAGE_SESSION_TOKEN` で指定します。省略時は SDK 認証情報チェーンを使用します。`artifact_storage_read_profiles` は YAML または JSON 環境変数 `GPUSTACK_ARTIFACT_STORAGE_READ_PROFILES` で設定します。
+
+タイムアウト、保持期間、過去の読み取り設定、manifest、保守コマンドは[アーティファクトストレージ](../user-guide/artifact-storage.md)を参照してください。
+
 ### 利用可能な環境変数 { #available-environment-variables }
 
 ほとんどのコマンドラインパラメーターは、`GPUSTACK_`プレフィックスを付け、名前を大文字にした

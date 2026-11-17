@@ -352,7 +352,7 @@ ARG TARGETOS
 ARG TARGETARCH
 ARG SEAWEEDFS_VERSION
 
-# Source/wheel installs do not assume the packaged storage service is present.
+# Enable builtin artifact storage by default in the packaged server.
 ENV GPUSTACK_PACKAGED=1
 
 ## Install the pinned single-node artifact S3 service (amd64 and arm64).

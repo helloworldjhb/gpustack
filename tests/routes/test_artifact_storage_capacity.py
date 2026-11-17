@@ -5,9 +5,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from gpustack.api.exceptions import register_handlers
+from gpustack.api.exceptions import InvalidException, register_handlers
 from gpustack.api.tenant import get_tenant_context
+from gpustack.artifacts import ArtifactStorageError
+from gpustack.artifacts.capacity import CapacityManager
 from gpustack.routes import artifact_storage
+from gpustack.schemas.artifact_storage import ArtifactCapacityUpdate, MAX_CAPACITY_BYTES
 
 
 def usage(maximum=0):
@@ -69,7 +72,7 @@ def test_capacity_update_rejects_invalid_limits_before_side_effects(monkeypatch,
 
 
 @pytest.mark.parametrize('method', ['get', 'put'])
-def test_database_errors_are_safe_and_explicit(monkeypatch, method):
+def test_database_errors_are_safe_and_explicit(monkeypatch, caplog, method):
     manager = SimpleNamespace(
         usage=AsyncMock(side_effect=RuntimeError('postgresql://secret@private')),
         set_limit=AsyncMock(side_effect=RuntimeError('s3-secret-key')),
@@ -85,3 +88,44 @@ def test_database_errors_are_safe_and_explicit(monkeypatch, method):
     assert 'capacity_unavailable' in response.text
     assert 'secret' not in response.text
     assert 'private' not in response.text
+    records = [
+        record for record in caplog.records if record.name == artifact_storage.__name__
+    ]
+    assert len(records) == 1
+    operation = 'read' if method == 'get' else 'update'
+    assert records[0].levelname == 'ERROR'
+    assert operation in records[0].getMessage()
+    assert 'RuntimeError' in records[0].getMessage()
+    assert 'secret' not in caplog.text
+    assert 'private' not in caplog.text
+
+
+@pytest.mark.parametrize('method', ['get', 'put'])
+def test_capacity_storage_errors_preserve_safe_reason(monkeypatch, method):
+    manager = SimpleNamespace(
+        usage=AsyncMock(side_effect=ArtifactStorageError('invalid_migration_history')),
+        set_limit=AsyncMock(
+            side_effect=ArtifactStorageError('invalid_migration_history')
+        ),
+    )
+    monkeypatch.setattr(artifact_storage, 'CapacityManager', lambda: manager)
+    with TestClient(application(True)) as client:
+        response = (
+            client.get('/capacity')
+            if method == 'get'
+            else client.put('/capacity', json={'max_bytes': 0})
+        )
+    assert response.status_code == 503
+    assert response.json()['details'] == {'code': 'invalid_migration_history'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('value', [-1, MAX_CAPACITY_BYTES + 1])
+async def test_capacity_manager_validation_is_a_client_error(monkeypatch, value):
+    manager = CapacityManager(config=SimpleNamespace())
+    monkeypatch.setattr(artifact_storage, 'CapacityManager', lambda: manager)
+    body = ArtifactCapacityUpdate.model_construct(max_bytes=value)
+    with pytest.raises(InvalidException) as exc:
+        await artifact_storage.update_artifact_storage_capacity(body, None)
+    assert exc.value.status_code == 422
+    assert exc.value.details == {'code': 'invalid_capacity_bytes'}

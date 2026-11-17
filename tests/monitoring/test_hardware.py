@@ -231,6 +231,31 @@ async def test_failed_hardware_queries_keep_failure_reason_and_diagnostics(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('all_devices', [False, True])
+async def test_identity_presence_failure_logs_safe_diagnostics(
+    monkeypatch, caplog, all_devices
+):
+    hardware, session, _ = _environment(monkeypatch, [_worker()])
+    secret = 'https://private-user:private-password@prom.example.test'
+    monkeypatch.setattr(
+        hardware, '_identity_presence', AsyncMock(side_effect=OSError(secret))
+    )
+
+    result = await _collect(hardware, session, all_devices=all_devices)
+
+    assert result.available
+    assert result.metrics['gpu_utilization'].status == 'available'
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == hardware.__name__ and record.levelname == 'WARNING'
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].message == 'GPU identity presence query failed (OSError)'
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_invalid_or_foreign_device_is_rejected_before_prometheus(monkeypatch):
     hardware, session, calls = _environment(monkeypatch, [_worker()])
     with pytest.raises(InvalidException):

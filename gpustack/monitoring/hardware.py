@@ -380,7 +380,8 @@ async def _collect_history(devices, selected, worker, response, client, url):
             _identity_presence(devices, client, url, response.end, semaphore),
             timeout=COLLECTION_TIMEOUT_SECONDS,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning('GPU identity presence query failed (%s)', type(exc).__name__)
         for device in devices:
             if device.identity is not None:
                 device.public.reason = 'query_failed'
@@ -614,7 +615,8 @@ async def _collect_all_history(
             _identity_presence(devices, client, url, end, semaphore),
             timeout=COLLECTION_TIMEOUT_SECONDS,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning('GPU identity presence query failed (%s)', type(exc).__name__)
         for device in devices:
             if device.identity is not None:
                 device.public.reason = 'query_failed'

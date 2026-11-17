@@ -251,7 +251,8 @@ class CacheProviderInjection(BaseModel):
     """Connector config injected into an inference engine that attaches to a cache service."""
 
     env: Dict[str, str] = {}
-    """Env template. Values support {{placeholder}}; entries rendering empty are dropped."""
+    """Env template. Empty values are dropped. Registered cache runtime variables
+    are resolved by each worker; other placeholders are resolved on the server."""
 
     kv_transfer_config: Optional[CacheProviderKVTransferConfig] = None
     """The engine's connector slot, rendered ahead of args as
@@ -411,6 +412,21 @@ class CacheProviderL2Field(BaseModel):
     """When set, the value is an additional Prometheus scrape address
     (host:port or URL) for this storage backend, added to the service's
     scrape targets. Never rendered into the adapter JSON or env."""
+
+    enabled_adapter_options: Optional[Dict[str, Any]] = None
+    """For a boolean field, top-level adapter JSON options emitted only
+    when enabled, instead of emitting the field name and boolean value."""
+
+    @model_validator(mode="after")
+    def _validate_enabled_adapter_options(self):
+        if self.enabled_adapter_options is not None and (
+            self.type != "boolean" or self.env_name or self.metrics_target
+        ):
+            raise ValueError(
+                "enabled_adapter_options requires a boolean field without "
+                "env_name or metrics_target"
+            )
+        return self
 
 
 class CacheProviderL2Backend(BaseModel):
@@ -1012,6 +1028,27 @@ class CacheProvider(BaseModel):
             return None
         return self.components.get(name)
 
+    def component_replica_count(
+        self, name: str, config_fields: Optional[Dict[str, Any]]
+    ) -> int:
+        """Resolve replicas through field defaults and visibility gates.
+
+        Missing, nonnumeric, or below-one values keep the component's
+        declared count. An implicit component has one replica.
+        """
+        spec = self.get_component(name)
+        count = spec.replicas if spec else 1
+        if spec is None or not spec.replicas_by:
+            return count
+        resolved = resolved_field_values(self.fields, config_fields or {})
+        configured = resolved.get(spec.replicas_by)
+        try:
+            if configured is not None and int(configured) >= 1:
+                count = int(configured)
+        except (TypeError, ValueError):
+            pass
+        return count
+
     def _port_layout(self, component: Optional[str]) -> CacheProviderComponent:
         """The declaration answering port questions for a component —
         IMPLICIT_COMPONENT for the single process a provider without
@@ -1542,6 +1579,10 @@ def _render_l2_adapter_fields(
         if value is None or value == "":
             continue
         value = _coerce_l2_field_value(field, value)
+        if field.enabled_adapter_options is not None:
+            if value:
+                adapter.update(field.enabled_adapter_options)
+            continue
         if field.env_name:
             env[field.env_name] = str(value)
             continue
@@ -1661,6 +1702,22 @@ def resolved_field_values(
     return resolved
 
 
+CACHE_ENV_RUNTIME_VARIABLES: Dict[str, str] = {"worker_ip": "ip"}
+"""Cache env placeholders mapped to attributes of the current inference worker."""
+
+
+def _deferred_cache_env_variables() -> Dict[str, str]:
+    """Preserve runtime placeholders in the server-rendered snapshot."""
+    return {name: "{{" + name + "}}" for name in CACHE_ENV_RUNTIME_VARIABLES}
+
+
+def _strip_cache_env_variables(template: str) -> str:
+    """Exclude exact runtime env references from server-placeholder validation."""
+    for placeholder in _deferred_cache_env_variables().values():
+        template = template.replace(placeholder, "")
+    return template
+
+
 RESERVED_INJECTION_PLACEHOLDERS = frozenset(
     {
         "host",
@@ -1693,7 +1750,10 @@ def validate_injection_templates(provider: "CacheProvider") -> List[str]:
         buckets = [set(bucket) for bucket in injection.locality_params.values()]
         locality_common = set.intersection(*buckets) if buckets else set()
         templates: List[str] = []
-        templates.extend(injection.env.values())
+        # Only env values receive a second rendering pass on the worker.
+        templates.extend(
+            _strip_cache_env_variables(value) for value in injection.env.values()
+        )
         templates.extend(injection.args)
         templates.extend(injection.files.values())
         if injection.kv_transfer_config:
@@ -1886,8 +1946,10 @@ def render_injection(
     field means.
     """
     env: Dict[str, str] = {}
+    # Shared snapshots must preserve runtime values for each worker to resolve.
+    env_params = {**params, **_deferred_cache_env_variables()}
     for key, value in (integration.injection.env or {}).items():
-        rendered = render_template(value, params)
+        rendered = render_template(value, env_params)
         if rendered:
             env[key] = rendered
     args: List[str] = []

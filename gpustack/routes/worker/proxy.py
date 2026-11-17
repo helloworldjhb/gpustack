@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 from starlette.background import BackgroundTask
 
-from gpustack.api.auth import worker_auth
+from gpustack.api.auth import worker_proxy_auth
 from gpustack.api.exceptions import (
     GatewayTimeoutException,
     ServiceUnavailableException,
@@ -25,9 +25,10 @@ from gpustack.api.exceptions import (
 from gpustack import envs
 from gpustack.utils.network import use_proxy_env_for_url
 from gpustack.utils.stall import stall_error_sse
-from gpustack.gateway.utils import get_instance_id_from_header, router_header_key
+from gpustack.gateway.utils import router_header_key
+from gpustack.utils.model_instance_workers import parse_model_instance_target
 
-router = APIRouter(dependencies=[Depends(worker_auth)])
+router = APIRouter(dependencies=[Depends(worker_proxy_auth)])
 
 logger = logging.getLogger(__name__)
 
@@ -387,6 +388,8 @@ async def proxy(path: str, request: Request):  # noqa: C901
             message=error_message,
             is_openai_exception=True,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         error_message = "An unexpected error occurred"
         if str(e):
@@ -410,16 +413,26 @@ def get_model_instance_info_from_model_name(
 
     Return (port, model_instance_id).
     """
-    model_instance_id = get_instance_id_from_header(request.headers)
-    port: Optional[int] = request.app.state.get_instance_port_by_model_instance_id(
-        model_instance_id
+    try:
+        target = parse_model_instance_target(request.headers.get(router_header_key, ""))
+    except ValueError as exc:
+        raise NotFoundException(message="Invalid model destination") from exc
+    model_instance_id = target.instance_id
+    endpoint = request.app.state.get_instance_endpoint_by_model_instance_id(
+        model_instance_id,
+        model_id=target.model_id,
+        dp_rank=target.dp_rank,
+        worker_id=target.worker_id,
     )
-    if not port:
+    if endpoint is None:
         raise NotFoundException(
             message=f"No running model instance found for model name: {model_instance_id}",
         )
-    logger.debug(f"Found port {port} from model instance id {model_instance_id}")
-    return port, model_instance_id
+    request.state.model_instance_endpoint = endpoint
+    logger.debug(
+        f"Found port {endpoint.port} from model instance id {model_instance_id}"
+    )
+    return endpoint.port, model_instance_id
 
 
 async def set_port_from_model_name(request: Request, call_next):
@@ -432,7 +445,7 @@ async def set_port_from_model_name(request: Request, call_next):
         request.state.x_target_port = str(port)
         request.state.x_target_instance_id = model_instance_id
         return await call_next(request)
-    except NotFoundException as e:
+    except (NotFoundException, ServiceUnavailableException) as e:
         logger.debug("failed to find model instance for proxying: %s", e.message)
         return JSONResponse(
             status_code=e.status_code,

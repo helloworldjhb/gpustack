@@ -4,7 +4,7 @@ from sqlalchemy import true
 from sqlalchemy.orm import selectinload
 from sqlmodel import and_, col, func, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
-from typing import Any, Callable, List, Optional, Set, Tuple, Union, Dict
+from typing import Any, Awaitable, Callable, List, Optional, Set, Tuple, Union, Dict
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from gpustack.schemas.model_routes import (
@@ -39,10 +39,13 @@ from gpustack.schemas.models import Model
 from gpustack.server.controllers import notify_model_ai_proxy_change
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
+from gpustack.api.streaming import tenant_streaming
 from gpustack.api.tenant import (
     TenantContext,
     assert_resource_visible,
+    bypass_tenant_filter,
     tenant_list_conditions,
+    tenant_stream_filter,
 )
 from gpustack.schemas.users import User
 from gpustack.api.exceptions import (
@@ -263,6 +266,14 @@ def _model_route_grant_predicate(
     return _ok
 
 
+def _route_consumption_stream_filter(
+    *predicates: Optional[Callable[[Any], bool]],
+) -> Callable[[Any], bool]:
+    """Combine grant and per-user policies for the consumption views."""
+    active = [predicate for predicate in predicates if predicate is not None]
+    return lambda data: all(predicate(data) for predicate in active)
+
+
 def _state_conditions(
     target_class: Union[ModelRoute, MyModel],
     state: Optional[ModelStateFilterEnum],
@@ -342,8 +353,6 @@ async def _get_model_routes(
         stream_predicates = [
             p
             for p in (
-                my_model_stream_filter,
-                route_grant_stream_filter,
                 (
                     (
                         lambda d: state_stream_filter(
@@ -364,11 +373,24 @@ async def _get_model_routes(
                     return False
             return True
 
+        # Consumption views include grants and public routes; management
+        # streams use the entry point's owner-scoped default.
+        visibility_filter = (
+            _route_consumption_stream_filter(
+                my_model_stream_filter, route_grant_stream_filter
+            )
+            if target_class is MyModel or include_grants
+            else None
+        )
+
         return StreamingResponse(
-            target_class.streaming(
+            tenant_streaming(
+                target_class,
+                ctx,
                 fields=fields,
                 fuzzy_fields=fuzzy_fields,
                 filter_func=_stream_filter,
+                visibility_filter=visibility_filter,
             ),
             media_type="text/event-stream",
         )
@@ -471,36 +493,21 @@ async def _apply_effective_name_to_my_models(
         )
 
 
-def _drop_derived_meta_keys(meta: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Strip server-derived meta keys from client input.
-    ``meta[lb_mode]`` is a passive record of what the route's targets
-    add up to, re-derived on every reconcile; a client-supplied value
-    would be stale at best and a lie at worst, so it never reaches the
-    row."""
-    if not meta:
-        return meta
-    return {k: v for k, v in meta.items() if k != LB_MODE_META_KEY}
-
-
 def _merge_meta_update(
     existing_meta: Optional[Dict[str, Any]], input_meta: Optional[Dict[str, Any]]
 ) -> Dict[str, Any]:
     """The meta an explicit update writes: the client's keys minus the
-    plugin-owned and derived ones, with the plugin-owned keys carried
-    over from the stored row. Responses hide plugin-owned meta keys (see
-    _strip_plugin_meta_keys), so a client round-tripping a response or
-    editing unrelated metadata sends a meta without them — and a client
-    that forges them anyway is dropped, because deleting or writing a
-    policy is expressed through the plugins section, never through
-    meta."""
-    from gpustack.routes.plugins import route_plugins
+    plugin-owned ones (registered names and derived keys alike), with
+    the plugin-owned keys carried over from the stored row. Responses
+    hide plugin-owned meta keys (see _strip_plugin_meta_keys), so a
+    client round-tripping a response or editing unrelated metadata
+    sends a meta without them — and a client that forges them anyway is
+    dropped, because deleting or writing a policy is expressed through
+    the plugins section, never through meta."""
+    from gpustack.routes.plugins import route_plugin_meta_keys
 
-    reserved = {p.name for p in route_plugins()}
-    cleaned = {
-        k: v
-        for k, v in (_drop_derived_meta_keys(input_meta) or {}).items()
-        if k not in reserved
-    }
+    reserved = route_plugin_meta_keys()
+    cleaned = {k: v for k, v in (input_meta or {}).items() if k not in reserved}
     preserved = {k: v for k, v in (existing_meta or {}).items() if k in reserved}
     return {**cleaned, **preserved}
 
@@ -610,14 +617,14 @@ async def _route_with_fresh_lb_mode(session: AsyncSession, route_id: int) -> Mod
 def _strip_plugin_meta_keys(items: List[Any]) -> None:
     """Hide plugin-owned meta keys from responses: ``plugins.*`` is the
     plugins' public face, and a visible storage copy invites clients to
-    write it directly. The derived ``lb_mode`` is hoisted to its
-    top-level response field and dropped from meta, so every path
-    (list, detail, create, update) exposes the same shape. The stored
-    row is untouched (``__dict__`` writes, like the other response
-    rewrites)."""
-    from gpustack.routes.plugins import route_plugins
+    write it directly. Derived keys are plugin-owned too, so they are
+    hidden the same way; the derived ``lb_mode`` is additionally hoisted
+    to its top-level response field, so every path (list, detail,
+    create, update) exposes the same shape. The stored row is untouched
+    (``__dict__`` writes, like the other response rewrites)."""
+    from gpustack.routes.plugins import route_plugin_meta_keys
 
-    plugin_keys = {p.name for p in route_plugins()}
+    plugin_keys = route_plugin_meta_keys()
     for item in items:
         meta = item.__dict__.get("meta") or getattr(item, "meta", None) or {}
         if any(k in meta for k in plugin_keys):
@@ -625,12 +632,6 @@ def _strip_plugin_meta_keys(items: List[Any]) -> None:
                 k: v for k, v in meta.items() if k not in plugin_keys
             }
         item.__dict__["lb_mode"] = meta.get(LB_MODE_META_KEY)
-        if LB_MODE_META_KEY in meta:
-            if "meta" not in item.__dict__:
-                item.__dict__["meta"] = dict(meta)
-            item.__dict__["meta"] = {
-                k: v for k, v in item.__dict__["meta"].items() if k != LB_MODE_META_KEY
-            }
 
 
 async def _apply_route_plugin_sections(session: AsyncSession, items: List[Any]) -> None:
@@ -803,7 +804,6 @@ async def create_model_route(
     source["meta"] = _merge_meta_update(None, source.get("meta")) or None
     targets = input.targets or []
     await validate_targets(session, targets, route_owner_principal_id=target_org_id)
-    source["targets"] = len(targets)
     source["owner_principal_id"] = target_org_id
 
     # Multi-tenant default: a non-platform Org's new route is scoped to
@@ -835,6 +835,7 @@ async def create_model_route(
             targets=targets,
             auto_commit=False,
         )
+        await _recount_route_targets(session, route)
         await _assert_consistent_lb_weights(session, route.id)
         # Auto-grant the owning Org so the defaulted ALLOWED_PRINCIPALS
         # route is visible to its members out of the box. Users can add
@@ -919,7 +920,7 @@ async def update_model_route(
         input_data["meta"] = _merge_meta_update(existing.meta, input_data["meta"])
     try:
         if input.targets is not None or input.name != existing.name:
-            target_count, _ = await batch_handle_targets(
+            await batch_handle_targets(
                 session=session,
                 route_id=existing.id,
                 route_name=existing.name,
@@ -928,7 +929,7 @@ async def update_model_route(
                 new_route_name=input.name if input.name != existing.name else None,
                 route_owner_principal_id=existing.owner_principal_id,
             )
-            input_data["targets"] = target_count
+            await _recount_route_targets(session, existing)
         await ModelRouteService(session).update(
             existing, source=input_data, auto_commit=False
         )
@@ -1038,7 +1039,7 @@ async def add_model_route_targets(
         route,
         not_found_message=f"ModelRoute with id '{id}' not found.",
     )
-    target_count, touched_targets = await batch_handle_targets(
+    _, touched_targets = await batch_handle_targets(
         session=session,
         route_id=route.id,
         route_name=route.name,
@@ -1048,7 +1049,7 @@ async def add_model_route_targets(
         auto_commit=False,
     )
     try:
-        route.targets = target_count
+        await _recount_route_targets(session, route)
         await ModelRouteService(session=session).update(route, auto_commit=True)
         await session.commit()
         # New targets carry no UPDATED event of their own; enqueue the
@@ -1089,6 +1090,29 @@ async def _assert_consistent_lb_weights(session: AsyncSession, route_id: int) ->
             "either every target of a route carries a positive weight or "
             "none may — a mix leaves LB unable to render the route"
         )
+
+
+async def _recount_route_targets(session: AsyncSession, route: ModelRoute) -> None:
+    """Set a route's derived target counters from the staged post-write rows.
+
+    ``targets``/``ready_targets`` describe the target set, and the write
+    path must commit them in the same transaction as the target rows it
+    stages: the after-commit event publishes the row exactly as committed,
+    and a pre-reconcile ``ready_targets`` (only recomputed later by
+    ``ModelRouteController._sync_targets``) can reach watch-stream clients
+    out of order and regress a route the REST API already reports ready.
+    Reads the staged row state the same way ``_assert_consistent_lb_weights``
+    does — the autoflush returns exactly the rows this transaction is about
+    to commit.
+    """
+    targets = await ModelRouteTarget.all_by_field(session, "route_id", route.id)
+    # soft-deleted rows linger in the table; they no longer count — the
+    # same exclusion ``_assert_consistent_lb_weights`` above applies
+    live_targets = [t for t in targets if t.deleted_at is None]
+    route.targets = len(live_targets)
+    route.ready_targets = len(
+        [t for t in live_targets if t.state == TargetStateEnum.ACTIVE]
+    )
 
 
 async def batch_handle_targets(
@@ -1418,10 +1442,39 @@ def validate_provider_model_name(
         )
 
 
+def _target_stream_visibility(
+    ctx: TenantContext,
+) -> Callable[[Any], Union[bool, Awaitable[bool]]]:
+    if bypass_tenant_filter(ctx):
+        return lambda data: True
+
+    visible = tenant_stream_filter(ctx, ModelRoute)
+    # Parent snapshots use the shared cache's write invalidation and TTL.
+    # Rebuild the index only when the snapshot changes; visibility is still
+    # evaluated against this connection's tenant context for every event.
+    snapshot: Any = None
+    routes_by_id: Dict[int, Any] = {}
+
+    async def parent_visible(data: Any) -> bool:
+        nonlocal snapshot, routes_by_id
+        route_id = getattr(data, "route_id", None)
+        if route_id is None:
+            return False
+        routes = await ModelRoute.cached_all()
+        if routes is not snapshot:
+            routes_by_id = {route.id: route for route in routes}
+            snapshot = routes
+        parent = routes_by_id.get(route_id)
+        return parent is not None and parent.deleted_at is None and visible(parent)
+
+    return parent_visible
+
+
 @target_router.get(
     "", response_model=ModelRouteTargetsPublic, response_model_exclude_none=True
 )
 async def get_model_route_targets(
+    ctx: TenantContextDep,
     params: ModelRouteTargetListParams = Depends(),
     name: str = None,
     search: str = None,
@@ -1445,9 +1498,26 @@ async def get_model_route_targets(
     )
     fields.update(ext_fields)
 
+    extra_conditions = []
+    if not bypass_tenant_filter(ctx):
+        extra_conditions.append(
+            ModelRouteTarget.route_id.in_(
+                select(ModelRoute.id).where(
+                    ModelRoute.deleted_at.is_(None),
+                    *tenant_list_conditions(ctx, ModelRoute),
+                )
+            )
+        )
+
     if params.watch:
         return StreamingResponse(
-            ModelRouteTarget.streaming(fields=fields, fuzzy_fields=fuzzy_fields),
+            tenant_streaming(
+                ModelRouteTarget,
+                ctx,
+                fields=fields,
+                fuzzy_fields=fuzzy_fields,
+                visibility_filter=_target_stream_visibility(ctx),
+            ),
             media_type="text/event-stream",
         )
 
@@ -1456,6 +1526,7 @@ async def get_model_route_targets(
             session=session,
             fields=fields,
             fuzzy_fields=fuzzy_fields,
+            extra_conditions=extra_conditions,
             page=params.page,
             per_page=params.perPage,
             order_by=params.order_by,
@@ -1515,6 +1586,12 @@ async def update_model_route_target(
             existing_target_map={id: existing},
             auto_commit=False,
         )
+        # Any field change rewrites the target's state (UNAVAILABLE for a
+        # model target pending re-validation, ACTIVE for a provider one),
+        # so the route's derived counters must follow in this same commit —
+        # the after-commit event publishes the row as committed.
+        await _recount_route_targets(session, parent_route)
+        await ModelRouteService(session=session).update(parent_route, auto_commit=False)
         await _assert_consistent_lb_weights(session, existing.route_id)
         await session.commit()
     except InvalidException:
@@ -1555,7 +1632,7 @@ async def delete_model_route_target(
         await dispatch_target_hooks("delete", existing, None, session)
         await existing.delete(session=session, auto_commit=False)
         if route:
-            route.targets = max(0, route.targets - 1)
+            await _recount_route_targets(session, route)
             await ModelRouteService(session=session).update(route, auto_commit=False)
         await session.commit()
         await _refresh_route_lb_mode(session, existing.route_id)
@@ -1595,6 +1672,25 @@ async def set_fallback_target(
         if input.fallback_status_codes is not None:
             await unset_fallback_target(session, existing.route_id, auto_commit=False)
         existing.fallback_status_codes = input.fallback_status_codes
+        if input.fallback_status_codes is None and not (existing.weight or 0):
+            # Clearing the codes turns the row back into an LB candidate.
+            # A fallback-only row typically carries weight 0 (meaningless
+            # on the fallback path); kept as-is it would leave the route
+            # with a weighted/unweighted mix that LB cannot render, and
+            # the weight-consistency check below would reject the very
+            # update that turns the fallback off. Restore the default
+            # weight instead so the candidate classifies.
+            others = await ModelRouteTarget.all_by_field(
+                session, "route_id", existing.route_id
+            )
+            if any(
+                target.deleted_at is None
+                and target.id != existing.id
+                and not target.fallback_status_codes
+                and (target.weight or 0) > 0
+                for target in others
+            ):
+                existing.weight = 100
         await existing.update(session=session, auto_commit=False)
         # clearing the codes turns the target back into an LB candidate
         # — the post-write shape must still classify

@@ -14,11 +14,16 @@ chart repository turns this suite red.
 import pathlib
 import shutil
 import subprocess
+from copy import deepcopy
+from functools import lru_cache
 
 import pytest
 import yaml
 
+from gpustack import __operator_version__
+
 HELM = shutil.which("helm")
+SAFE_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 pytestmark = pytest.mark.skipif(HELM is None, reason="helm is not installed")
 
@@ -114,6 +119,18 @@ SERVER_AND_TOKEN = [
 
 
 def render(*args: str) -> list[dict]:
+    # Identical values render once, but assertions receive independent objects.
+    return deepcopy(_render(*args))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def render_cache():
+    yield
+    _render.cache_clear()
+
+
+@lru_cache(maxsize=None)
+def _render(*args: str) -> list[dict]:
     result = subprocess.run(
         [HELM, "template", "gpustack", CHART, *BASE, *args],
         capture_output=True,
@@ -122,7 +139,7 @@ def render(*args: str) -> list[dict]:
     )
     if result.returncode != 0:
         pytest.fail(f"helm template failed:\n{result.stderr}")
-    return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+    return [doc for doc in yaml.load_all(result.stdout, Loader=SAFE_YAML_LOADER) if doc]
 
 
 def render_error(*args: str) -> str:
@@ -171,6 +188,51 @@ class TestServerOnly:
         assert "registration-token" not in names(render(), "Secret")
 
 
+class TestHigressPlugins:
+    """The plugin-server Deployment rides the server image by default.
+
+    The server publishes WasmPlugin URLs from its own bundled
+    gpustack-higress-plugins manifest, so a plugin-server on a stale dedicated
+    image 404s them and wedges the gateway listener. Sharing the server
+    image.tag makes the two move together under `helm upgrade --set
+    image.tag=...` without pulling a new chart.
+    """
+
+    def _deployment(self, docs: list[dict]) -> dict:
+        for doc in docs:
+            if doc["kind"] == "Deployment" and doc["metadata"]["name"].endswith(
+                "higress-plugins"
+            ):
+                return doc
+        pytest.fail("higress-plugins Deployment not rendered")
+
+    def test_defaults_to_the_server_image(self):
+        pod_spec = self._deployment(render())["spec"]["template"]["spec"]
+        container = pod_spec["containers"][0]
+        assert container["image"] == "docker.io/gpustack/gpustack:test"
+        # The server image's ENTRYPOINT funnels everything into
+        # `gpustack start`; the plugin server must bypass it explicitly, with
+        # the command the dedicated image's Dockerfile CMD already carries.
+        assert container["command"] == [
+            "gpustack-plugins",
+            "start",
+            "--port",
+            "8080",
+            "--host",
+            "0.0.0.0",
+        ]
+
+    def test_pinned_dedicated_image_still_renders(self):
+        docs = render(
+            "--set",
+            "higressPlugins.image.repository=gpustack/higress-plugins",
+            "--set",
+            "higressPlugins.image.tag=0.5.0.post2",
+        )
+        container = self._deployment(docs)["spec"]["template"]["spec"]["containers"][0]
+        assert container["image"] == "docker.io/gpustack/higress-plugins:0.5.0.post2"
+
+
 class TestServerAndWorker:
     def test_deploys_both_and_the_operator(self):
         docs = render("--set", "worker.enabled=true")
@@ -178,6 +240,17 @@ class TestServerAndWorker:
         assert "gpustack-worker" in names(docs, "DaemonSet")
         assert "gpustack-operator-worker" in names(docs, "Deployment")
         assert "kueue-controller-manager" in names(docs, "Deployment")
+
+    def test_operator_and_kueue_images_match_the_exported_release(self):
+        docs = render("--set", "worker.enabled=true")
+        images = {
+            container["image"]
+            for doc in docs
+            if doc["kind"] == "Deployment"
+            for container in doc["spec"]["template"]["spec"]["containers"]
+        }
+        assert f"docker.io/gpustack/gpustack-operator:{__operator_version__}" in images
+        assert "docker.io/gpustack/mirrored-kueue:v0.18.11" in images
 
     def test_workers_address_the_in_release_server(self):
         docs = render("--set", "worker.enabled=true")
@@ -193,6 +266,58 @@ class TestServerAndWorker:
             "gpustack-worker-nvidia",
             "gpustack-worker-amd",
         }
+
+
+@pytest.mark.parametrize(
+    "certmanager, override, expected",
+    [
+        ("false", {}, {"insecureSkipVerify": True}),
+        (
+            "true",
+            {},
+            {
+                "serverName": "kueue-controller-manager-metrics-service.default.svc",
+                "insecureSkipVerify": False,
+                "ca": {
+                    "secret": {
+                        "name": "kueue-metrics-server-cert",
+                        "key": "ca.crt",
+                    }
+                },
+            },
+        ),
+        (
+            "true",
+            {"serverName": "metrics.example.com", "insecureSkipVerify": False},
+            {"serverName": "metrics.example.com", "insecureSkipVerify": False},
+        ),
+        (
+            "false",
+            {"serverName": "metrics.example.com"},
+            {"serverName": "metrics.example.com", "insecureSkipVerify": True},
+        ),
+    ],
+)
+def test_kueue_metrics_tls(certmanager, override, expected):
+    args = [
+        "--set",
+        "worker.enabled=true",
+        "--set",
+        "gpustack-operator.kueue.enablePrometheus=true",
+        "--set",
+        f"gpustack-operator.global.certmanager.enabled={certmanager}",
+    ]
+    for key, value in override.items():
+        args.extend(
+            [
+                "--set",
+                "gpustack-operator.kueue.metrics.serviceMonitor.tlsConfig."
+                f"{key}={str(value).lower() if isinstance(value, bool) else value}",
+            ]
+        )
+    monitors = [doc for doc in render(*args) if doc["kind"] == "ServiceMonitor"]
+    assert len(monitors) == 1
+    assert monitors[0]["spec"]["endpoints"][0]["tlsConfig"] == expected
 
 
 class TestCPUWorkerDisabled:
@@ -660,3 +785,32 @@ class TestGatewayTLSVersions:
             assert "is not a TLS version Higress accepts" in error
             # The operator has to recognize what they typed in the message.
             assert f'"{value}"' in error
+
+
+class TestWorkerOperatorSettingsAccess:
+    """The worker SA carries the server's operator-settings calls through the
+    cluster proxy, so it must be able to read and patch ``gpustack.ai``
+    Settings."""
+
+    def test_worker_can_read_and_patch_settings(self):
+        docs = render("--set", "worker.enabled=true")
+        role = next(
+            d
+            for d in docs
+            if d["kind"] == "ClusterRole"
+            and d["metadata"]["name"] == "gpustack-worker-workload-api"
+        )
+        rule = next(
+            r
+            for r in role["rules"]
+            if "settings" in r.get("resources", [])
+            and "gpustack.ai" in r.get("apiGroups", [])
+        )
+        assert {"get", "patch"} <= set(rule["verbs"])
+        binding = next(
+            d
+            for d in docs
+            if d["kind"] == "ClusterRoleBinding"
+            and d["roleRef"]["name"] == role["metadata"]["name"]
+        )
+        assert binding["subjects"][0]["name"] == "gpustack-worker"

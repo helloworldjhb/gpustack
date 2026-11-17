@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import or_
 from starlette.responses import StreamingResponse
 
+from gpustack.api.streaming import tenant_streaming
 from gpustack.api.exceptions import (
+    HTTPException as APIHTTPException,
     NotFoundException,
     InternalServerErrorException,
     AlreadyExistsException,
@@ -73,10 +75,12 @@ async def get_gpu_instance_templates(
             else (lambda tmpl: is_visible(tmpl, ctx))
         )
         return StreamingResponse(
-            GPUInstanceTemplate.streaming(
+            tenant_streaming(
+                GPUInstanceTemplate,
+                ctx,
                 fields=fields,
                 fuzzy_fields=fuzzy_fields,
-                filter_func=filter_func,
+                visibility_filter=filter_func,
             ),
             media_type="text/event-stream",
         )
@@ -273,6 +277,8 @@ def manageable_conditions(ctx: TenantContext) -> list:
 async def handle_error(message: str):
     try:
         yield
+    except APIHTTPException:
+        raise
     except Exception as e:
         raise InternalServerErrorException(
             message=message,

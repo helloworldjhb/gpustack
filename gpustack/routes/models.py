@@ -13,6 +13,7 @@ from sqlmodel import or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack import envs
+from gpustack.api.streaming import tenant_streaming
 from gpustack.api.exceptions import (
     AlreadyExistsException,
     HTTPException,
@@ -25,11 +26,15 @@ from gpustack.api.exceptions import (
 from gpustack.schemas.common import Pagination
 from gpustack.schemas.inference_backend import is_custom_backend
 from gpustack.schemas.models import (
+    CategoryEnum,
     ModelInstance,
     ModelInstanceStateEnum,
     ModelInstancesPublic,
     BackendEnum,
+    get_backend,
     ModelListParams,
+    shared_cache_service_ids_by_role,
+    role_backend_field,
 )
 from gpustack.schemas.cache_services import (
     CacheService,
@@ -55,39 +60,33 @@ from gpustack.schemas.deployment_document import (
     entry_label,
     load_deployments,
 )
-from gpustack.schemas.clusters import Cluster, GatherStrategyEnum
+from gpustack.schemas.clusters import Cluster
 from gpustack.schemas.gpu_instance_types import GPUInstanceType
 from gpustack.schemas.workers import GPUDeviceStatus, Worker
 from gpustack.utils.version import version_in_range
 from gpustack.api.tenant import (
     TenantContext,
-    bypass_tenant_filter,
     assert_cluster_visible,
     assert_resource_visible,
-    cluster_scoped_system,
-    scoped_cluster_row_visible,
     tenant_list_conditions,
 )
 from gpustack.server.db import async_session
 from gpustack.server.deps import (
-    CurrentUserDep,
     ListParamsDep,
     SessionDep,
     TenantContextDep,
 )
 from gpustack.schemas.models import (
-    PD_BACKENDS,
     ExtendedKVCacheConfig,
     LoraListEntry,
-    PDModeEnum,
     Model,
     ModelCreate,
     ModelSpecBase,
     ModelUpdate,
     ModelPublic,
+    ModelRestartResult,
     ModelsPublic,
-    RoleNameEnum,
-    role_effective_model,
+    ScalingSchedule,
 )
 from gpustack.schemas.model_routes import (
     AccessPolicyEnum,
@@ -104,7 +103,7 @@ from gpustack.server.services import (
     WorkerService,
     revoke_model_access_cache,
 )
-from gpustack.server.controllers import model_spec_digest
+from gpustack.server.controllers import model_members_stale, model_spec_digest
 from gpustack.server.model_revisions import (
     append_revision,
     deployment_spec,
@@ -120,17 +119,10 @@ from gpustack.server.lora_model_routes import (
     create_lora_model_routes,
     is_lora_list_stale,
 )
-from gpustack.server.pd_pairing import (
-    DIFFER,
-    PAIRING_MUST_MATCH,
-    compare_max_model_len,
-    compare_must_match,
-    effective_tensor_parallelism,
-    role_parameters,
-    tensor_parallel_rule,
-    violates_tensor_parallel_direction,
-)
-from gpustack.utils.command import find_last_parameter, find_parameter
+from gpustack.validation.pd import validate_pd_config
+from gpustack.validation.pd.placement import roles_that_must_span
+from gpustack.validation.pd.roles import validate_pd_cache_provider
+from gpustack.utils.command import find_parameter
 from gpustack.utils.export_limits import attachment_headers, sanitize_filename
 from gpustack.utils.convert import safe_int
 from gpustack.utils.gpu import parse_gpu_id
@@ -142,26 +134,21 @@ from gpustack.routes.model_common import (
     model_state_stream_filter,
 )
 from gpustack.config.config import get_global_config
-from gpustack.schemas.pd_modes import PDTensorParallelPairingEnum
-from gpustack.server.pd_mode_catalog import get_pd_mode
-from gpustack.server.pd_mode_resolver import resolve_pd_mode
-from gpustack.server.cluster_accelerators import cluster_vendors
 from gpustack.utils.grafana import build_model_dashboard_url, resolve_grafana_base_url
 from gpustack.utils.lora_model_source import lora_route_name_for
+from gpustack.utils.model_instance_workers import (
+    get_model_instance_workloads,
+    requires_model_instance_stop_barrier,
+)
 
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
 
-def _make_model_watch_filter(ctx, categories, state=None):
-    """Watch-stream visibility: cluster-bound service accounts only see
-    their own cluster's models; everyone keeps the categories and state
-    filters. Predicates are pre-built so inactive filters cost nothing on
-    the per-event hot path."""
+def _make_model_watch_filter(categories, state=None):
+    """Match the watch stream against category and state business filters."""
     predicates = []
-    if cluster_scoped_system(ctx):
-        predicates.append(lambda data: scoped_cluster_row_visible(ctx, data))
     if state is not None:
         predicates.append(lambda data: model_state_stream_filter(data, state))
     if categories:
@@ -200,21 +187,14 @@ async def get_models(
     if backend:
         fields["backend"] = backend
 
-    # Streaming uses field-equality only; scope by current org so non-admin
-    # users never see cross-org rows via the live stream. Admin without an
-    # explicit org context keeps the unfiltered cross-org stream. System
-    # users (workers / cluster accounts) bypass owner scoping — they serve
-    # every Org's models — but cluster-bound service accounts are narrowed
-    # to their own cluster's rows below.
-    if ctx.current_principal_id is not None and not bypass_tenant_filter(ctx):
-        fields["owner_principal_id"] = ctx.current_principal_id
-
     if params.watch:
         return StreamingResponse(
-            Model.streaming(
+            tenant_streaming(
+                Model,
+                ctx,
                 fields=fields,
                 fuzzy_fields=fuzzy_fields,
-                filter_func=_make_model_watch_filter(ctx, categories, state),
+                filter_func=_make_model_watch_filter(categories, state),
             ),
             media_type="text/event-stream",
         )
@@ -257,12 +237,12 @@ async def get_models(
 @router.get("/adapters", response_model=Dict[str, Any])
 async def get_model_adapters(
     session: SessionDep,
-    user: CurrentUserDep,
+    ctx: TenantContextDep,
     base: str = Query(
         ...,
         description=(
-            "Base model repo id (e.g. Qwen/Qwen3-8B) for HF/ModelScope adapter discovery; "
-            "also used to match local cached LoRAs."
+            "Base model repo id (e.g. Qwen/Qwen3-8B) for remote HF/ModelScope "
+            "adapter discovery only."
         ),
     ),
     q: Optional[str] = Query(
@@ -276,8 +256,7 @@ async def get_model_adapters(
         description="Max adapter entries per remote source (HF and ModelScope).",
     ),
 ):
-    _ = user
-    return await list_adapters_for_base(session, base, q=q, limit=limit)
+    return await list_adapters_for_base(session, base, ctx=ctx, q=q, limit=limit)
 
 
 @router.get("/{id}", response_model=ModelPublic)
@@ -289,6 +268,11 @@ async def get_model(
     model = await Model.one_by_id(session, id, options=[selectinload(Model.instances)])
     assert_resource_visible(ctx, model, not_found_message="Model not found")
     public = ModelPublic.model_validate(model)
+    # Recovery reads this before starting a member. Controller-maintained
+    # status can lag a saved edit or a deployment stop/start cycle.
+    public.stale = await model_members_stale(
+        session, model, [i for i in model.instances if i.deleted_at is None]
+    )
     public.has_stale_lora_instances = is_lora_list_stale(model)
     return public
 
@@ -317,6 +301,7 @@ async def get_model_dashboard(
         resolve_grafana_base_url(cfg, request),
         model,
         cluster_name=cluster.name if cluster is not None else None,
+        request=request,
     )
     if dashboard_url is None:
         raise InternalServerErrorException(
@@ -347,7 +332,12 @@ async def get_model_instances(ctx: TenantContextDep, id: int, params: ListParams
             assert_resource_visible(ctx, model, not_found_message="Model not found")
         fields = {"model_id": id}
         return StreamingResponse(
-            ModelInstance.streaming(fields=fields),
+            tenant_streaming(
+                ModelInstance,
+                ctx,
+                fields=fields,
+                visibility_filter=lambda data: getattr(data, "model_id", None) == id,
+            ),
             media_type="text/event-stream",
         )
 
@@ -389,7 +379,8 @@ async def get_model_cache_metrics(
         window_seconds = parse_metrics_window(window)
     except ValueError as e:
         raise BadRequestException(message=str(e))
-    if not (model.extended_kv_cache and model.extended_kv_cache.is_shared()):
+    cache_services_by_role = shared_cache_service_ids_by_role(model)
+    if not cache_services_by_role:
         return ModelCacheMetricsPublic(
             available=False,
             reason="The deployment does not use a shared cache service",
@@ -402,6 +393,7 @@ async def get_model_cache_metrics(
             worker_name=instance.worker_name,
         )
         for instance in model.instances
+        if getattr(instance, "role", None) in cache_services_by_role
     ]
     attached.sort(key=lambda row: row.model_instance_name or "")
     return await collect_model_cache_metrics(
@@ -410,6 +402,48 @@ async def get_model_cache_metrics(
         window_seconds,
         client=getattr(request.app.state, "http_client_no_proxy", None),
     )
+
+
+def _preserve_scaling_schedule_pause(
+    schedule: Optional[ScalingSchedule],
+    stored: Optional[Model] = None,
+    allow_override: bool = False,
+) -> Optional[ScalingSchedule]:
+    """Keep runtime pause state on an enabled plan, independently of edits."""
+    if schedule is None:
+        return None
+    previous = stored.scaling_schedule if stored is not None else None
+    if allow_override and "paused" in schedule.model_fields_set:
+        paused = schedule.enabled and schedule.paused
+    else:
+        paused = bool(
+            schedule.enabled and previous and previous.enabled and previous.paused
+        )
+    return schedule.model_copy(update={"paused": paused})
+
+
+def _merge_scaling_schedule_update(
+    model_in: ModelUpdate, stored: Model, allow_pause_override: bool = True
+) -> None:
+    """Keep sparse edits subject to the stored schedule's replica ownership."""
+    if "scaling_schedule" in model_in.model_fields_set:
+        model_in.scaling_schedule = _preserve_scaling_schedule_pause(
+            model_in.scaling_schedule, stored, allow_override=allow_pause_override
+        )
+        return
+    schedule = stored.scaling_schedule
+    if (
+        schedule
+        and schedule.enabled
+        and "replicas" in model_in.model_fields_set
+        and model_in.replicas != stored.replicas
+    ):
+        raise BadRequestException(
+            message="Disable scheduled scaling before manually changing replicas."
+        )
+    # Validation and reconciliation need the stored schedule, but an unrelated
+    # edit must not persist a schedule the caller did not submit.
+    object.__setattr__(model_in, "scaling_schedule", schedule)
 
 
 def apply_scaling_schedule_baseline(
@@ -430,6 +464,9 @@ def apply_scaling_schedule_baseline(
     """
     schedule = getattr(model_in, "scaling_schedule", None)
     if not schedule or not schedule.enabled:
+        return
+    if schedule.paused:
+        model_in.replicas = 0
         return
     effective = compute_desired_replicas(schedule)
     if effective is not None:
@@ -460,647 +497,68 @@ def _max_intended_replicas(
     )
 
 
-def validate_roles(  # noqa: C901
-    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
-    stored: Optional[Model] = None,
-) -> None:
-    """Structural checks on a multi-role deployment.
-
-    These checks deliberately reject rather than reinterpret. Every rule here
-    exists because the alternative — silently folding the request into
-    something adjacent — is the failure mode that makes a deployment behave
-    unlike what the user typed.
-
-    `stored` is the row being updated, and every rule below is judged against
-    the *merged* state. A sparse PUT carries only the fields it changes, so
-    without this a request that adds a schedule without resending `roles` would
-    be judged as a role-less model and the schedule would be accepted onto a
-    group — exactly the combination the rule forbids, reached by not mentioning
-    the thing that makes it illegal. Same shape for `replicas`. Read-only, so
-    nothing here can widen what the request persists.
-    """
-
-    def field(name: str):
-        submitted = getattr(model_in, name, None)
-        if submitted is not None:
-            return submitted
-        if stored is not None and name not in getattr(
-            model_in, "model_fields_set", set()
-        ):
-            return getattr(stored, name, None)
-        return submitted
-
-    roles = field("roles")
-    disaggregation = field("disaggregation")
-
-    if not roles:
-        if disaggregation is not None:
-            raise BadRequestException(
-                message="disaggregation requires roles: declare a prefill and a decode role."
-            )
-        return
-
-    names = [role.name for role in roles]
-    duplicates = {name for name in names if names.count(name) > 1}
-    if duplicates:
-        raise BadRequestException(
-            message=f"Duplicate role name(s): {', '.join(sorted(duplicates))}."
-        )
-
-    allowed = {item.value for item in RoleNameEnum}
-    unknown = [name for name in names if name not in allowed]
-    if unknown:
-        raise BadRequestException(
-            message=(
-                f"Unsupported role name(s): {', '.join(unknown)}. "
-                f"Supported roles are {', '.join(sorted(allowed))}."
-            )
-        )
-
-    for role in roles:
-        if role.name == RoleNameEnum.ROUTER.value and role.replicas != 1:
-            raise BadRequestException(
-                message="The router role runs exactly one replica."
-            )
-        # Refused rather than ignored. Prefill and decode get CPU and memory
-        # from sizing — the weights and the parallelism decide them — so a
-        # hand-written value here would be a second source for the same number
-        # that silently disagrees with the estimate.
-        if role.resources is not None and role.name != RoleNameEnum.ROUTER.value:
-            raise BadRequestException(
-                message=(
-                    f"Role '{role.name}' cannot declare CPU or memory: only the "
-                    "router does, because it holds no weights. Every other "
-                    "role's footprint is derived from the model."
-                )
-            )
-        # Refused rather than ignored, and for the same reason `resources` is:
-        # a value nothing reads is indistinguishable from one that was never
-        # sent. Until this field existed the role's adapters were dropped by
-        # `extra="ignore"` and the response was a 200 with no `lora_list` in
-        # it — the user's only clue that their configuration had not been
-        # stored was reading the record back and noticing an absence.
-        if role.lora_list:
-            raise BadRequestException(
-                message=(
-                    f"Role '{role.name}' cannot declare LoRA adapters: a "
-                    "multi-role deployment is reached through its router, and "
-                    "the router's member table is indexed by served-model "
-                    "name, so an adapter name attached to one role never "
-                    "resolves to that role. Declare lora_list on the model "
-                    "instead, or deploy the adapters as their own model."
-                )
-            )
-        if role.resources is not None:
-            if role.resources.cpu is not None and role.resources.cpu <= 0:
-                raise BadRequestException(
-                    message="The router's CPU request must be greater than zero."
-                )
-            if role.resources.memory is not None and role.resources.memory <= 0:
-                raise BadRequestException(
-                    message="The router's memory request must be greater than zero."
-                )
-
-    # `dependencies` is a start order, so a cycle is a deployment that never
-    # starts. Reject it here rather than letting the controller spin.
-    known = set(names)
-    graph = {role.name: list(role.dependencies or []) for role in roles}
-    for name, deps in graph.items():
-        for dep in deps:
-            if dep not in known:
-                raise BadRequestException(
-                    message=f"Role '{name}' depends on '{dep}', which is not declared."
-                )
-            if dep == name:
-                raise BadRequestException(
-                    message=f"Role '{name}' cannot depend on itself."
-                )
-    visiting: set = set()
-    done: set = set()
-
-    def _walk(name: str) -> None:
-        if name in done:
-            return
-        if name in visiting:
-            raise BadRequestException(
-                message=f"Role dependencies form a cycle through '{name}'."
-            )
-        visiting.add(name)
-        for dep in graph.get(name, []):
-            _walk(dep)
-        visiting.discard(name)
-        done.add(name)
-
-    for name in graph:
-        _walk(name)
-
-    # `roles[].replicas` is the only scaling truth, so a model-level count
-    # above one would be a second one. Refuse instead of quietly reading it as
-    # a multiplier — an implicit mode switch is exactly what makes a
-    # deployment stop matching its own spec.
-    if field("replicas") not in (0, 1):
-        raise BadRequestException(
-            message=(
-                "A model with roles uses replicas as an on/off switch (0 or 1). "
-                "Scale a disaggregated deployment through roles[].replicas."
-            )
-        )
-
-    # The scaling scheduler writes `model.replicas` directly, without passing
-    # through this validation, so a window rule holding 3 would break the
-    # deployment at its next tick rather than at submit time.
-    schedule = field("scaling_schedule")
-    if schedule and schedule.enabled:
-        raise BadRequestException(
-            message="Scheduled scaling is not supported for a model with roles."
-        )
-
-    if disaggregation is None:
-        return
-
-    counts = {name: names.count(name) for name in allowed}
-    if counts[RoleNameEnum.PREFILL.value] != 1:
-        raise BadRequestException(
-            message="A disaggregated model needs exactly one prefill role."
-        )
-    if counts[RoleNameEnum.DECODE.value] != 1:
-        raise BadRequestException(
-            message="A disaggregated model needs exactly one decode role."
-        )
-    if counts[RoleNameEnum.ROUTER.value] > 1:
-        raise BadRequestException(
-            message="A disaggregated model has at most one router."
-        )
-
-    _reject_lora_under_disaggregation(field)
-    _reject_an_engine_that_cannot_be_disaggregated(field, roles)
-    _reject_cache_under_a_hand_written_mode(field, roles, disaggregation)
-    _reject_a_policy_the_mode_cannot_apply(disaggregation)
-    _reject_router_params_the_platform_owns(roles, disaggregation)
-
-    # A recipe injects one engine's connector configuration into every role,
-    # so a role on a different engine would receive settings it cannot read.
-    #
-    # Read off the recipe rather than a table restating it. The catalog is
-    # already loaded by the time this line runs -- the two rejections above
-    # resolve the same mode -- so the second source of truth was buying a
-    # dict lookup and owing a start-up assertion that the two still agreed.
-    mode = get_pd_mode(disaggregation.mode.value)
-    permitted = list(mode.backends) if mode else []
-    if permitted:
-        for role in roles:
-            role_backend = role.backend or field("backend")
-            if role_backend and role_backend not in permitted:
-                raise BadRequestException(
-                    message=(
-                        f"Role '{role.name}' runs backend '{role_backend}', which "
-                        f"pd mode '{disaggregation.mode.value}' cannot configure "
-                        f"(it targets {', '.join(permitted)}). Mixing engines "
-                        f"across roles requires pd mode 'custom', where the "
-                        f"connection parameters are yours to supply."
-                    )
-                )
-
-
-def _reject_router_params_the_platform_owns(roles, disaggregation) -> None:
-    """A router parameter that would collide with an injected one.
-
-    The router's tunable flags are meant to be overridden — appending them is
-    last-wins, verified against both shipped wheels. The connection flags are
-    not, and refusing them is not tidiness:
-
-    - ``--prefill`` / ``--decode`` are ``action="append"`` in both routers, so
-      a second one does not replace the injected peer. It adds one the router
-      then forwards to and cannot reach, and the only symptom is a member that
-      quietly never gets traffic.
-    - ``--host`` / ``--port`` / ``--prometheus-*`` are last-wins, which is
-      worse in a different way: the router comes up bound somewhere the
-      gateway and the metrics scraper are not looking.
-
-    The list is read off the recipe rather than written here, so adding a mode
-    cannot forget to extend it.
-    """
-    router = next(
-        (
-            r
-            for r in roles
-            if r.name == RoleNameEnum.ROUTER.value and r.backend_parameters
-        ),
-        None,
-    )
-    if router is None:
-        return
-    mode = get_pd_mode(disaggregation.mode.value)
-    if mode is None or mode.router is None:
-        return
-    owned = set(mode.router.platform_owned_flags)
-    if not owned:
-        return
-    for param in router.backend_parameters:
-        # Both spellings a user can write: `--flag value` and `--flag=value`.
-        name = str(param).split("=", 1)[0].strip()
-        if name in owned:
-            raise BadRequestException(
-                message=(
-                    f"'{name}' on the router is set by GPUStack from where the "
-                    f"group was placed, so it cannot be given here. Adjustable "
-                    f"router flags for this mode: "
-                    f"{', '.join(a.flag for a in mode.router.tunable_args) or 'none'}."
-                )
-            )
-
-
-def _mode_renders_connector_key(mode, key: str) -> bool:
-    """Whether any of the mode's roles renders `key` into its connector
-    descriptor.
-
-    Reads the descriptors rather than searching the serialized mode for
-    `{{key}}`: a full-text search over `model_dump_json()` also matches the
-    word appearing in a description, and misses a recipe that supplies a
-    literal value instead of a placeholder. Both are the wrong answer for the
-    question being asked, which is whether the user's value reaches the engine.
-    """
-    for role in (mode.roles or {}).values():
-        if key in (role.connector or {}):
-            return True
-    return False
-
-
-def _reject_a_policy_the_mode_cannot_apply(disaggregation) -> None:
-    """`kv_load_failure_policy` is a vLLM/NIXL setting, not a platform one.
-
-    Only `vllm-nixl` renders it. The SGLang modes have no equivalent concept
-    at all -- their KV lifecycle is a bootstrap timeout that aborts the
-    request, not a load that can fail and be retried -- and Mooncake's
-    connector does not read the key. So there is nothing to implement on the
-    other three; what there is, is a value the user weighed and set that then
-    quietly does nothing.
-
-    Which is why this rejects rather than warns, and only for a non-default
-    value. `fail` is what an engine that never sees the setting does anyway,
-    so refusing it would break every group on those modes to no purpose;
-    `recompute` is the deliberate choice -- trade a 500 for a silent
-    recomputation -- and a user who made it and got neither is worse off than
-    one who was told the mode cannot honour it.
-
-    Derived from the recipe rather than a list of mode names: a mode that
-    starts rendering the key is accepted the moment it does, with nothing here
-    to remember to update.
-    """
-    from gpustack.schemas.models import DisaggregationSpec
-
-    policy = disaggregation.kv_load_failure_policy
-    default = DisaggregationSpec.model_fields["kv_load_failure_policy"].default
-    if policy == default:
-        return
-
-    mode_name = disaggregation.mode.value
-    mode = get_pd_mode(mode_name)
-    if mode is None or _mode_renders_connector_key(mode, "kv_load_failure_policy"):
-        return
-
-    if disaggregation.mode == PDModeEnum.CUSTOM:
-        # The one mode where the setting may well be reachable, just not from
-        # here: `custom` injects nothing, so every connector key is the user's
-        # to write. Pointing them at another mode would be the wrong advice.
-        raise BadRequestException(
-            message=(
-                f"pd mode 'custom' injects no connector configuration, so "
-                f"kv_load_failure_policy='{policy}' would be stored and never "
-                f"reach the engine. Set it inside your own "
-                f"--kv-transfer-config instead."
-            )
-        )
-
-    raise BadRequestException(
-        message=(
-            f"pd mode '{mode_name}' cannot apply kv_load_failure_policy="
-            f"'{policy}': its KV connector has no such setting, so the value "
-            f"would be stored and never reach the engine. Leave it at "
-            f"'{default}', or use a mode whose connector reads it."
-        )
-    )
-
-
-def _reject_lora_under_disaggregation(field) -> None:
-    """LoRA adapters and disaggregation cannot be asked for together yet.
-
-    **The combination deploys and then refuses every request**, which is why
-    it is refused here instead of documented. The group reaches `running` with
-    all three members, the adapter's route `<base>:<adapter>` is created and
-    reports a ready target, a chat against the base name answers 200 — and a
-    chat against the adapter name answers 503 `No available workers`. The
-    engines are innocent: prefill and decode each list the adapter in their own
-    `GET /v1/models` and each answer a direct chat on it.
-
-    The wall is the router in front of the group. Its worker registry is indexed
-    by served-model name, and a member registers itself under `model_id:
-    "{{model_name}}"` — the base name, once. So the registry has no entry under
-    the adapter's name to hand the request to, and the honest reading of that is
-    that adapter names are not part of a group's addressing scheme at all.
-    Making them so is a change to the router's membership protocol, not a field
-    on this model.
-
-    Judged against the merged state, so neither direction of an update slips
-    past: adding adapters to a group that already disaggregates, and adding
-    disaggregation to a model that already carries adapters, are the same
-    combination arriving from opposite sides.
-
-    Admission-time only. A row that already holds both keeps reconciling — this
-    is never consulted outside create and update — because refusing to converge
-    a deployment that exists would take away the running base model too, and
-    the base model is the part that works.
-    """
-    if not field("lora_list"):
-        return
-
-    raise BadRequestException(
-        message=(
-            "A disaggregated deployment cannot serve LoRA adapters. A group is "
-            "addressed through its router, whose member table is indexed by "
-            "served-model name, and its members register under the base model's "
-            "name only — so a request naming an adapter reaches no member and "
-            "fails with 'No available workers', even though both engines have "
-            "the adapter loaded. Either remove the adapters from this "
-            "deployment and serve them from a non-disaggregated one, which is "
-            "unaffected, or remove the disaggregation."
-        )
-    )
-
-
-def _reject_an_engine_that_cannot_be_disaggregated(field, roles) -> None:
-    """An engine PD does not apply to, whatever the mode.
-
-    Distinct from the per-mode engine check further up, which asks whether a
-    *recipe* can be injected into a role and lets `custom` through because it
-    injects nothing. This one asks whether the engine can be disaggregated at
-    all, and `custom` is not an exemption from it: supplying the connection
-    parameters yourself does not give an engine a prompt KV cache to hand
-    across. Without this, `custom` mode is a way around the check entirely --
-    the `custom` recipe declares no `backends`, so the loop below does not run.
-
-    Judged per role and against the model-level engine each role falls back to,
-    because a group is only as disaggregable as the engine each member runs.
-    """
-    offenders = {
-        role.backend or field("backend")
-        for role in roles
-        if (role.backend or field("backend")) not in PD_BACKENDS
-    }
-    offenders.discard(None)
-    if not offenders:
-        return
-
-    raise BadRequestException(
-        message=(
-            f"Backend {', '.join(sorted(offenders))} cannot be disaggregated. "
-            f"Prefill/decode splits the prompt KV cache across two engines, "
-            f"which only {', '.join(PD_BACKENDS)} do here. Deploy this model "
-            f"without disaggregation, or switch it to one of those backends."
-        )
-    )
-
-
-def _reject_cache_under_a_hand_written_mode(field, roles, disaggregation) -> None:
-    """`custom` mode and an extended KV cache cannot be asked for together.
-
-    Everywhere else the two compose: GPUStack folds the mode's connector and
-    the cache's into one `MultiConnector`, which is what makes a disaggregated
-    deployment with a shared cache a supported combination rather than a
-    choice between them.
-
-    `custom` is the one mode that injects no connection state at all — its
-    whole contract is that the parameters are the user's. So there is nothing
-    to compose the cache with, and quietly injecting a connector under a mode
-    that promises not to would be the surprise this rejection exists to
-    prevent. Written by hand, both still fit in one flag; the engine composes
-    connectors and the user is the one holding the pen.
-    """
-    if disaggregation.mode != PDModeEnum.CUSTOM:
-        return
-
-    model_cache = field("extended_kv_cache")
-    for role in roles:
-        cache = (
-            role.extended_kv_cache
-            if role.extended_kv_cache is not None
-            else model_cache
-        )
-        if cache is None or not getattr(cache, "enabled", False):
-            continue
-        raise BadRequestException(
-            message=(
-                f"Role '{role.name}' enables the extended KV cache under pd "
-                "mode 'custom', which injects no connector configuration at "
-                "all — so there is nothing for GPUStack to compose the cache "
-                "into. Either choose a pd mode that configures a connector, "
-                "where the two are combined for you, or keep 'custom' and "
-                "write the combined configuration into backend_parameters."
-            )
-        )
-
-
-# The tables the two sides are compared through live in `server.pd_pairing`,
-# because the placement-time check and the `pairing_unverified` marker read
-# exactly the same ones. Keeping a second copy here is how the underscore
-# spellings went missing from one of them.
-
-
-def _toggle_enabled(toggle, parameters: List[str]) -> bool:
-    """Where a role's parameters leave one boolean engine switch.
-
-    Last spelling wins, matching argparse, so a role carrying both flags is
-    read the way the engine would read it rather than the way the list happens
-    to be ordered.
-    """
-    enabled = toggle.default_enabled
-    for token in parameters:
-        name = token.split("=", 1)[0]
-        if name == toggle.enable_flag:
-            enabled = True
-        elif name == toggle.disable_flag:
-            enabled = False
-    return enabled
-
-
-def _check_pairing_toggles(field, prefill_params, decode_params) -> None:
-    """Refuse a pair whose two roles land a declared boolean switch differently.
-
-    The switches are declared per backend in `pd-modes.yaml` under
-    `pairing_toggles` rather than written here, for the same reason the
-    value-carrying parameters live in `server/pd_pairing.py`'s tables: which
-    settings must match is a fact about the engine, and a fact kept in code is
-    one nobody finds when adding the next engine.
-    """
-    from gpustack.schemas.models import BackendEnum
-    from gpustack.server.pd_mode_catalog import get_pairing_toggles
-
-    # A deployment that names no backend runs vLLM, the same default
-    # `get_backend` applies once the row exists.
-    backend = field("backend") or BackendEnum.VLLM
-    for toggle in get_pairing_toggles(backend):
-        if _toggle_enabled(toggle, prefill_params) == _toggle_enabled(
-            toggle, decode_params
-        ):
-            continue
-        detail = toggle.description or f"the two roles disagree on {toggle.key}"
-        raise BadRequestException(
-            message=(
-                f"prefill and decode disagree on {toggle.key}: {detail}. The "
-                f"pair is then rejected on contact and the group never serves. "
-                f"Note that a KV connector may set this on its own — the "
-                f"divergence comes from one role carrying "
-                f"{toggle.enable_flag} and the other not."
-            )
-        )
-
-
-def _check_tensor_parallel_pairing(disaggregation, *, prefill_tp, decode_tp) -> None:
-    """Apply the recipe's declared tensor-parallel direction.
-
-    The direction belongs to the KV connector, so it is read off the mode
-    (`PDMode.pairing.tensor_parallel`) rather than written here: NIXL needs
-    decode at least as wide as prefill, vllm-ascend's Mooncake needs the
-    opposite (Huawei's reference deployment is prefill TP4 / decode TP1), and
-    `custom` injects no connector GPUStack knows. A mode the catalog cannot
-    resolve is held to the NIXL rule, which is what every mode was held to
-    before the rule became declarable.
-    """
-    mode_name = disaggregation.mode.value
-    rule = tensor_parallel_rule(get_pd_mode(mode_name))
-    if not violates_tensor_parallel_direction(
-        rule, prefill_tp=prefill_tp, decode_tp=decode_tp
+def _is_schedule_pause_only_update(
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase], stored: Optional[Model]
+) -> bool:
+    """Allow stopping an unchanged plan even when its placement is unavailable."""
+    schedule = model_in.scaling_schedule
+    previous = stored.scaling_schedule if stored is not None else None
+    if not (
+        schedule
+        and schedule.enabled
+        and schedule.paused
+        and previous
+        and previous.enabled
     ):
-        return
+        return False
+    if schedule.model_dump(exclude={"paused"}) != previous.model_dump(
+        exclude={"paused"}
+    ):
+        return False
+    fields = model_in.model_fields_set - {"replicas", "scaling_schedule"}
+    if (
+        not is_custom_backend(model_in.backend)
+        and model_in.image_name
+        and model_in.image_name == stored.image_name
+        and model_in.backend_version is None
+    ):
+        # An unchanged image selects the runtime; clearing its unused catalog
+        # version does not change the deployment's placement configuration.
+        fields.discard("backend_version")
+    return all(getattr(model_in, field) == getattr(stored, field) for field in fields)
 
-    if rule == PDTensorParallelPairingEnum.DECODE_GE_PREFILL:
-        raise BadRequestException(
-            message=(
-                f"decode runs tensor parallelism {decode_tp}, below prefill's "
-                f"{prefill_tp}. A decode narrower than its prefill cannot "
-                f"receive that prefill's KV layout, and the engine reports it "
-                f"as an IndexError inside decode rather than as a "
-                f"configuration error. decode's tensor parallelism must be at "
-                f"least prefill's."
-            )
-        )
-    raise BadRequestException(
-        message=(
-            f"prefill runs tensor parallelism {prefill_tp}, below decode's "
-            f"{decode_tp}. pd mode '{mode_name}' gathers each decode rank's "
-            f"KV from prefill ranks, which needs prefill's tensor "
-            f"parallelism to be at least decode's."
-        )
+
+def _validate_sglang_smg_policy(model_in, stored=None) -> None:
+    from gpustack.utils.model_instance_workers import (
+        validate_sglang_smg_policy,
+        validate_sglang_dpa_version,
     )
+    from gpustack.validation.pd.common import effective_model_spec
+
+    try:
+        effective = effective_model_spec(model_in, stored)
+        validate_sglang_dpa_version(effective)
+        validate_sglang_smg_policy(effective)
+    except ValueError as exc:
+        raise BadRequestException(message=str(exc)) from exc
 
 
-def validate_role_pairing(  # noqa: C901
-    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
-    stored: Optional[Model] = None,
-) -> None:
-    """Reject prefill/decode pairs the engines will accept and serve wrongly.
+def _validate_manual_dp_config(model_in, stored=None) -> bool:
+    from gpustack.utils.vllm_topology import manual_dp_enabled
+    from gpustack.validation.pd.common import effective_model_spec
 
-    The division of labour with the engine is deliberate and documented in X1
-    3.1: most handshake factors are hashed by the connector and rejected on
-    contact, so re-checking them here buys attribution, not safety. Two are
-    different.
-
-    `max_model_len` is checked by nothing at all. Measured with prefill at 8192
-    and decode at 4096: the handshake passes, KV transfers, short prompts
-    answer normally, and only a prompt above decode's window fails — with a 400
-    from decode, after prefill has already computed it. The user is left
-    believing the deployment serves 8192.
-
-    Tensor parallelism is asserted by the engine at run time, but a decode
-    narrower than its prefill surfaces as an `IndexError` inside decode rather
-    than as a configuration error, so the hard block is worth more than the
-    assertion.
-
-    **Every rule here refuses only what it can prove.** The test is whether
-    both sides' effective values are determinable from the spec, not whether
-    both sides typed the parameter — `server.pd_pairing` holds that
-    distinction and says why substituting the engines' defaults instead would
-    have been wrong for every one of them. A factor one side left silent is
-    not decided here and not refused here; the deployment carries
-    `pairing_unverified` and says so.
-
-    That asymmetry is the point on this path in particular. `evaluate_model_input`
-    turns a refusal into the red compatibility error in the deploy form, so a
-    rule that guesses does not produce a 400 an operator can argue with — it
-    produces a form that refuses to submit a deployment which would have run.
-
-    This is a pre-check, not a mirror of the engine's factor set — vLLM's own
-    source says that set is "likely to evolve significantly over time", so the
-    engine stays the final judge.
-    """
-
-    def field(name: str):
-        submitted = getattr(model_in, name, None)
-        if submitted is not None:
-            return submitted
-        if stored is not None and name not in getattr(
-            model_in, "model_fields_set", set()
-        ):
-            return getattr(stored, name, None)
-        return submitted
-
-    roles = field("roles")
-    if not roles or not field("disaggregation"):
-        return
-
-    model_parameters = field("backend_parameters")
-    prefill = next((r for r in roles if r.name == RoleNameEnum.PREFILL.value), None)
-    decode = next((r for r in roles if r.name == RoleNameEnum.DECODE.value), None)
-    if prefill is None or decode is None:
-        return
-
-    prefill_params = role_parameters(prefill, model_parameters)
-    decode_params = role_parameters(decode, model_parameters)
-
-    verdict, prefill_len, decode_len = compare_max_model_len(
-        prefill_params, decode_params
-    )
-    if verdict == DIFFER:
+    effective = effective_model_spec(model_in, stored)
+    enabled = manual_dp_enabled(effective.env)
+    role_enabled = any(manual_dp_enabled(role.env) for role in effective.roles or [])
+    if (enabled or role_enabled) and (
+        get_backend(effective) != BackendEnum.VLLM
+        or effective.roles
+        or effective.disaggregation is not None
+    ):
         raise BadRequestException(
-            message=(
-                f"prefill and decode declare different context lengths "
-                f"({prefill_len} vs {decode_len}). No engine checks this: "
-                f"the pair handshakes, transfers KV and answers short "
-                f"prompts, and a prompt above "
-                f"{min(prefill_len, decode_len)} tokens fails at decode "
-                f"after prefill has already computed it. Give both roles "
-                f"the same context length."
-            )
+            message='GPUSTACK_MANUAL_DP is supported only for ordinary vLLM deployments.'
         )
-
-    # Effective, not declared. A role that writes no tp is not a role with an
-    # unknown one when it pins its own cards: the backend injects the card
-    # count for a single-worker member, so a decode pinned to one card beside a
-    # prefill at TP2 is a real inversion and worth catching. A role that pins
-    # nothing stays unknown and is reported as unverified rather than
-    # held to a 1 it was never going to run.
-    prefill_tp = effective_tensor_parallelism(prefill, prefill_params)
-    decode_tp = effective_tensor_parallelism(decode, decode_params)
-    if prefill_tp is not None and decode_tp is not None:
-        _check_tensor_parallel_pairing(
-            field("disaggregation"), prefill_tp=prefill_tp, decode_tp=decode_tp
-        )
-
-    _check_pairing_toggles(field, prefill_params, decode_params)
-
-    for label, names in PAIRING_MUST_MATCH.items():
-        if compare_must_match(label, names, prefill_params, decode_params) != DIFFER:
-            continue
-        prefill_value = find_last_parameter(prefill_params, names)
-        decode_value = find_last_parameter(decode_params, names)
-        raise BadRequestException(
-            message=(
-                f"prefill and decode declare different {label} "
-                f"('{prefill_value}' vs '{decode_value}'). The connector "
-                f"rejects the pair on contact, so the group would never "
-                f"serve; the roles must agree."
-            )
-        )
+    return enabled
 
 
 async def validate_model_in(
@@ -1109,26 +567,52 @@ async def validate_model_in(
     *,
     cluster_id: Optional[int] = None,
     stored: Optional[Model] = None,
+    owner_principal_id: Optional[int] = None,
 ):
+    from gpustack.validation.pd.common import effective_model_spec
+
     # `stored` is the row being updated, so a sparse PUT is judged against the
     # merged state rather than against the handful of fields it happened to
     # send. Absent on create, where there is nothing to merge.
-    validate_roles(model_in, stored=stored)
-    validate_role_pairing(model_in, stored=stored)
-    await validate_pd_mode_runtime(
-        session, model_in, cluster_id=cluster_id, stored=stored
+    effective = effective_model_spec(model_in, stored)
+    manual_dp = _validate_manual_dp_config(effective)
+    await validate_pd_config(
+        session,
+        model_in,
+        cluster_id=cluster_id,
+        stored=stored,
+        owner_principal_id=owner_principal_id,
     )
-    await validate_gather_layer(session, model_in, cluster_id=cluster_id, stored=stored)
 
-    if getattr(model_in, "gpu_type_selector", None) is not None:
+    # API responses use short LoRA names; compare their stored form when
+    # deciding whether a request only pauses an unchanged deployment.
+    if not is_custom_backend(model_in.backend):
+        validate_and_normalize_lora_list(model_in)
+
+    pause_only = _is_schedule_pause_only_update(model_in, stored)
+    if not pause_only and getattr(model_in, "gpu_type_selector", None) is not None:
         await validate_gpu_type_selector(session, model_in, cluster_id=cluster_id)
 
-    if model_in.gpu_selector is not None and _max_intended_replicas(model_in) > 0:
+    if (
+        not pause_only
+        and model_in.gpu_selector is not None
+        and _max_intended_replicas(model_in) > 0
+    ):
         await validate_gpu_ids(session, model_in, cluster_id=cluster_id)
 
     if is_custom_backend(model_in.backend):
         logger.info("Skip model validation for custom backend")
         return
+
+    if get_backend(effective) == BackendEnum.VLLM and not manual_dp:
+        from gpustack.utils.vllm_topology import validate_managed_lb_parameters
+
+        try:
+            validate_managed_lb_parameters(effective.backend_parameters)
+        except ValueError as exc:
+            raise BadRequestException(message=str(exc)) from exc
+
+    _validate_sglang_smg_policy(model_in, stored)
 
     # A custom image carries its own version and is not described by the runner
     # catalog, so there is nothing for backend_version to select.
@@ -1147,13 +631,12 @@ async def validate_model_in(
 
         if param_gpu_layers:
             int_param_gpu_layers = safe_int(param_gpu_layers, None)
-            if (
-                not param_gpu_layers.isdigit()
-                or int_param_gpu_layers < 0
-                or int_param_gpu_layers > 999
+            # llama.cpp reads -1 as "auto" and -2 as "all".
+            if param_gpu_layers not in ("-1", "-2") and (
+                not param_gpu_layers.isdigit() or int_param_gpu_layers > 999
             ):
                 raise BadRequestException(
-                    message="Invalid backend parameter --gpu-layers. Please provide an integer in the range 0-999 (inclusive)."
+                    message="Invalid backend parameter --gpu-layers. Please provide -1 (auto), -2 (all), or an integer in the range 0-999 (inclusive)."
                 )
 
             if (
@@ -1193,8 +676,6 @@ async def validate_model_in(
         for param_names, error_message in unsupported_params:
             if find_parameter(model_in.backend_parameters, param_names):
                 raise BadRequestException(message=error_message)
-
-    validate_and_normalize_lora_list(model_in)
 
 
 def validate_and_normalize_lora_list(
@@ -1251,263 +732,6 @@ def validate_and_normalize_lora_list(
                 message=f"Duplicate lora_name '{short_name}' in lora_list."
             )
         seen.add(short_name)
-
-
-async def validate_pd_mode_runtime(
-    session: SessionDep,
-    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
-    *,
-    cluster_id: Optional[int] = None,
-    stored: Optional[Model] = None,
-):
-    """Reject a pd mode no accelerator in the cluster can run.
-
-    Every built-in recipe is accelerator-specific: `vllm-ascend-mooncake`
-    injects an Ascend-only connector plus HCCL variables, and the NVIDIA
-    recipes inject connectors no other runtime can read. Injecting one into
-    the wrong accelerator fails inside the connector rather than at submit
-    time. `PDModeRuntimeFilter` also drops the mismatched workers during
-    scheduling; this check exists so the answer is a readable refusal instead
-    of an empty candidate list.
-
-    `custom` is never rejected -- it declares no `gpu_filters`, so an
-    unsupported engine × accelerator pair means "no built-in recipe", never
-    "no PD".
-
-    Shares `resolve_pd_mode` with the resolve endpoint the form reads, so the
-    API cannot refuse a combination the form just told the user was fine.
-
-    Accelerator-less clusters are left to scheduling: a cluster whose workers
-    have not reported devices yet must not be judged as unable to run
-    anything.
-    """
-    disaggregation = getattr(model_in, "disaggregation", None)
-    if disaggregation is None and stored is not None:
-        if "disaggregation" not in getattr(model_in, "model_fields_set", set()):
-            disaggregation = getattr(stored, "disaggregation", None)
-    if not disaggregation:
-        return
-
-    mode_name = disaggregation.mode.value
-    mode = get_pd_mode(mode_name)
-    if mode is None or mode.gpu_filters is None or not mode.gpu_filters.vendor:
-        return
-
-    effective_cluster_id = cluster_id or getattr(model_in, "cluster_id", None)
-    vendors = await cluster_vendors(session, effective_cluster_id)
-    if not vendors:
-        return
-
-    backend = getattr(model_in, "backend", None) or (
-        getattr(stored, "backend", None) if stored else None
-    )
-    resolution = resolve_pd_mode(
-        backend, vendors, vendor=getattr(disaggregation, "vendor", None)
-    )
-    verdict = next(
-        (option for option in resolution.options if option.name == mode_name), None
-    )
-    if verdict is not None and not verdict.eligible:
-        raise BadRequestException(
-            message=(
-                f"pd mode '{mode_name}' cannot run here: "
-                f"{verdict.ineligible_reason}"
-            )
-        )
-
-
-async def validate_gather_layer(
-    session: SessionDep,
-    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
-    *,
-    cluster_id: Optional[int] = None,
-    stored: Optional[Model] = None,
-):
-    """Refuse a `gather.layer` this cluster has no rung for.
-
-    The failure this prevents is silence, not a crash. The solver's
-    `_enforced_gather` stands an unknown layer down and places the group as if
-    nothing had been asked for — correct behaviour there (a layer renamed under
-    a *running* deployment must not take it down) and exactly the wrong
-    behaviour at submit time, where it would accept a `MustGather` under a
-    promise nothing enforces.
-
-    It is checked here rather than on `GatherSpec` because the answer depends
-    on the cluster: the layer names are the cluster's own declaration, which a
-    field validator on the model has no access to. `accelerator_domain` is
-    subject to the same rule as every other name — valid only for a cluster
-    that actually declared a layer called that.
-
-    A cluster that cannot be read is left alone rather than guessed at:
-    scheduling still stands the requirement down, so the cost is a missed
-    refusal, not a wrong one.
-    """
-    gather = getattr(model_in, "gather", None)
-    if gather is None and stored is not None:
-        if "gather" not in getattr(model_in, "model_fields_set", set()):
-            gather = getattr(stored, "gather", None)
-    layer = getattr(gather, "layer", None)
-    if not layer:
-        return
-
-    from gpustack.schemas.clusters import Cluster
-    from gpustack.topology.tree import NODE_LAYER, TopologyError
-    from gpustack.topology.vocabulary import (
-        gather_layer_names,
-        validate_declaration,
-    )
-
-    if layer == NODE_LAYER:
-        await _refuse_a_floor_no_member_can_meet(session, model_in, cluster_id, stored)
-        return
-
-    effective_cluster_id = cluster_id or getattr(model_in, "cluster_id", None)
-    if effective_cluster_id is None:
-        return
-    cluster = await Cluster.one_by_id(session, effective_cluster_id)
-    if cluster is None:
-        return
-
-    try:
-        names = gather_layer_names(validate_declaration(cluster.topology))
-    except TopologyError:
-        # The cluster's own declaration is broken; refusing the *model* for it
-        # would send the operator to the wrong page.
-        return
-    if layer not in names:
-        raise BadRequestException(
-            message=(
-                f"gather layer {layer!r} is not a layer of this cluster. "
-                f"Available: {', '.join(names)}."
-            )
-        )
-
-
-async def _refuse_a_floor_no_member_can_meet(
-    session: SessionDep,
-    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
-    cluster_id: Optional[int],
-    stored: Optional[Model],
-):
-    """Refuse «all members on one machine» when a member cannot fit on one.
-
-    **The one contradiction cross-machine members introduce.** A floor at the
-    host rung says every member of the group sits on a single machine; a role
-    whose tensor-parallel width exceeds any machine in the cluster needs two.
-    Both are things the operator asked for, and no placement satisfies them
-    together.
-
-    Caught here rather than left to the solver because the two answers read
-    completely differently. At placement time it surfaces as a group that never
-    leaves PENDING with a capacity sentence beside it -- and the cluster is not
-    short of capacity, so the reader goes looking for cards that are already
-    there. At submit time it is one sentence naming the two settings that
-    disagree, while both are still on screen.
-
-    Silent about everything it cannot be sure of: a parallel width the engine
-    was never told, a cluster whose workers cannot be read, a backend whose
-    width this does not know how to ask for. A refusal is only worth issuing
-    when the contradiction is certain.
-    """
-    gather = getattr(model_in, "gather", None) or (
-        getattr(stored, "gather", None) if stored is not None else None
-    )
-    if getattr(gather, "strategy", None) != GatherStrategyEnum.MUST_GATHER:
-        # `PreferGather` at the host rung is a target, not a promise. A member
-        # that has to span simply misses it and says so afterwards.
-        return
-
-    spanning, widest = await roles_that_must_span(session, model_in, cluster_id)
-    for name, width in spanning:
-        raise BadRequestException(
-            message=(
-                f"Role {name!r} needs {width} GPUs and the widest worker "
-                f"in this cluster has {widest}, so it has to span machines — "
-                f"but this deployment also asks for every member to be on one "
-                f"machine, and to be refused rather than placed outside it. "
-                f"Lower the parallel size, or choose a looser topology floor."
-            )
-        )
-
-
-async def roles_that_must_span(
-    session: SessionDep,
-    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
-    cluster_id: Optional[int] = None,
-) -> Tuple[List[Tuple[str, int]], int]:
-    """Which roles cannot fit one machine, and how wide the widest machine is.
-
-    Arithmetic, not a placement solve — which is the whole reason it is safe to
-    ask while a form is still being typed. It compares a width the operator has
-    already stated against a fact about the cluster; it does not select
-    candidates, does not consult free capacity, and its answer does not move
-    while the rest of the form is filled in. It must not become the other
-    thing: a verdict about a finished configuration, asked of a half finished
-    one, which conflates «this tier does not fit» with «I cannot tell yet».
-
-    Empty is the answer for everything it cannot be sure of — a width the
-    engine was never told, a cluster whose workers cannot be read, a backend
-    whose width this does not know how to ask for. Both callers treat «not
-    sure» as «not spanning».
-    """
-    effective_cluster_id = cluster_id or getattr(model_in, "cluster_id", None)
-    if effective_cluster_id is None:
-        return [], 0
-
-    # Widths first: a deployment that never stated one cannot span anything,
-    # and asking the cluster about it would be a query for nothing.
-    widths = [
-        (spec.name, _role_gpu_width(model_in, spec.name))
-        for spec in getattr(model_in, "roles", None) or []
-    ]
-    widths = [(name, width) for name, width in widths if width]
-    if not widths:
-        return [], 0
-
-    workers = await Worker.all_by_field(session, "cluster_id", effective_cluster_id)
-    widest = max(
-        (len((w.status.gpu_devices or []) if w.status else []) for w in workers),
-        default=0,
-    )
-    if widest == 0:
-        return [], 0
-
-    return [(name, width) for name, width in widths if width > widest], widest
-
-
-def _role_gpu_width(model_in, role_name: str) -> Optional[int]:
-    """How many GPUs one member of this role wants, or None if not stated.
-
-    Asked of the selectors rather than re-derived: they already turn a mixed
-    bag of `--tensor-parallel-size` / `--tp-size` / `--pipeline-parallel-size`
-    / data parallelism into a world size, per engine, and a second reading of
-    those flags here is a second answer to one question.
-    """
-    from gpustack.policies.candidate_selectors import (
-        SGLangResourceFitSelector,
-        VLLMResourceFitSelector,
-    )
-    from gpustack.schemas.models import get_backend
-
-    try:
-        projected = role_effective_model(model_in, role_name)
-        backend = get_backend(projected)
-    except Exception:
-        return None
-    selectors = {
-        BackendEnum.VLLM: VLLMResourceFitSelector,
-        BackendEnum.SGLANG: SGLangResourceFitSelector,
-    }
-    selector = selectors.get(backend)
-    if selector is None:
-        return None
-    try:
-        world_size, _strategies = selector.get_world_size_from_backend_parameters(
-            projected
-        )
-    except Exception:
-        return None
-    return world_size
 
 
 async def validate_gpu_type_selector(
@@ -1788,8 +1012,8 @@ async def assert_cluster_belongs_to_org(
     (or another Org's) cluster, stamping a cross-tenant model. A cluster the
     caller can't see is reported as missing (404), so cross-tenant cluster
     ids can't be probed via a 403-vs-404 difference; a visible cluster owned
-    by another Org is a 403. No cluster chosen (``cluster_id is None``)
-    leaves default-cluster resolution to pick the Org's own cluster.
+    by another Org is a 403. With no chosen cluster (``cluster_id is None``),
+    this check is skipped; it does not select or assign a default cluster.
 
     ``cluster`` may be passed pre-fetched to avoid a duplicate lookup.
     """
@@ -1829,7 +1053,9 @@ class _CacheDeclaration(NamedTuple):
         return f" on role '{self.role}'" if self.role else ""
 
 
-def _cache_declarations(model_in) -> List[_CacheDeclaration]:
+def _cache_declarations(
+    model_in, *, include_model_defaults: bool = False
+) -> List[_CacheDeclaration]:
     """Every distinct cache configuration `model_in` would deploy.
 
     The inherit-when-None merge is spelled out rather than taken from
@@ -1838,23 +1064,30 @@ def _cache_declarations(model_in) -> List[_CacheDeclaration]:
     `RoleEffectiveModel` out of a request body to read three fields off it is a
     conversion the projection was not written for.
 
-    Deduplicated on the three fields that decide the answer, so a group whose
-    roles all inherit the Model's cache on the Model's engine is checked exactly
-    once and cannot start reporting a refusal against a role name for a value
-    the user wrote at the model level.
+    PD declarations retain their role because Store connector settings
+    differ between prefill and decode. Other deployments
+    deduplicate identical cache/backend configurations.
+
+    With roles, the model-level cache is only a default inherited by roles
+    that leave their cache unset. Include unused model defaults only when
+    normalizing submitted fields, not when validating runtime references.
     """
     model_ext = getattr(model_in, "extended_kv_cache", None)
     model_backend = getattr(model_in, "backend", None)
     model_version = getattr(model_in, "backend_version", None)
+    roles = getattr(model_in, "roles", None) or []
 
     declarations = [
         (
             _CacheDeclaration(None, model_ext, model_backend, model_version)
-            if model_ext
+            if model_ext and (not roles or include_model_defaults)
             else None
         )
     ]
-    for role in getattr(model_in, "roles", None) or []:
+    for role in roles:
+        if role.name == "router" and role.extended_kv_cache is None:
+            # Routers forward requests and do not inherit engine KV caches.
+            continue
         ext = (
             role.extended_kv_cache if role.extended_kv_cache is not None else model_ext
         )
@@ -1865,7 +1098,7 @@ def _cache_declarations(model_in) -> List[_CacheDeclaration]:
                 role.name,
                 ext,
                 role.backend or model_backend,
-                role.backend_version or model_version,
+                role_backend_field(role, "backend_version", model_version),
             )
         )
 
@@ -1875,6 +1108,7 @@ def _cache_declarations(model_in) -> List[_CacheDeclaration]:
         if declaration is None:
             continue
         key = (
+            declaration.role if getattr(model_in, "disaggregation", None) else None,
             declaration.ext.model_dump_json(),
             declaration.backend,
             declaration.backend_version,
@@ -1946,8 +1180,9 @@ async def validate_shared_kv_cache(
     model_in: Union[ModelCreate, ModelUpdate],
     owner_principal_id: int,
     effective_cluster_id: Optional[int],
+    stored: Optional[Model] = None,
 ) -> None:
-    """Validate every extended-KV-cache configuration this deployment declares.
+    """Validate the effective extended-KV-cache configuration of each role.
 
     "shared" mode attaches the model's inference engine to a CacheService
     row, so the service must exist, belong to the model's Org (a
@@ -1958,27 +1193,37 @@ async def validate_shared_kv_cache(
     stray cache_service_id is rejected as a mis-configuration rather than
     silently ignored.
 
-    **Every rule below applies to the role-level value as well as the
-    Model's**, because `extended_kv_cache` is a per-role override: checking
-    only the Model's would accept the identical configuration under
+    Each role's override, or its inherited Model default, receives the same
+    checks. A role-less deployment uses the Model's configuration directly.
+    Unused Model defaults are not runtime references and need no service
+    lookup. Checking only the Model's value would accept a configuration under
     `roles[].extended_kv_cache` in every case this function exists to refuse —
     a service id that names nothing, 'local' carrying a service id, 'shared'
     carrying none, a service in another cluster, another tenant's service, a
     provider that cannot configure the backend, an engine version under the
-    provider's floor. The one role-aware check in this area,
-    `_reject_cache_under_a_hand_written_mode`, does refuse a role-level
-    `enabled` — a role's cache was always meant to be seen here.
+    provider's floor. `validation.pd.roles` also checks the cache's compatibility
+    with the deployment's PD mode, including role-level overrides.
 
     Mutates `model_in` in place: `_drop_local_only_cache_knobs` clears the
-    local-cache sizing fields off a shared declaration.
+    local-cache sizing fields off submitted shared declarations. Inherited
+    role cache configurations remain untouched by a sparse update.
     """
-    declarations = _cache_declarations(model_in)
+    from gpustack.validation.pd.common import effective_model_spec
+
+    effective = effective_model_spec(model_in, stored)
+    declarations = _cache_declarations(effective)
     _reject_a_split_cache_pool(declarations)
     for declaration in declarations:
         await _validate_one_cache_declaration(
-            session, declaration, owner_principal_id, effective_cluster_id
+            session,
+            declaration,
+            owner_principal_id,
+            effective_cluster_id,
+            getattr(effective, "disaggregation", None),
         )
-    _drop_local_only_cache_knobs(declarations)
+    _drop_local_only_cache_knobs(
+        _cache_declarations(model_in, include_model_defaults=True)
+    )
 
 
 def _drop_local_only_cache_knobs(declarations: List[_CacheDeclaration]) -> None:
@@ -2029,6 +1274,7 @@ async def _validate_one_cache_declaration(
     declaration: _CacheDeclaration,
     owner_principal_id: int,
     effective_cluster_id: Optional[int],
+    disaggregation=None,
 ) -> None:
     ext = declaration.ext
     where = declaration.where
@@ -2068,6 +1314,10 @@ async def _validate_one_cache_declaration(
                 f"model{where}."
             )
         )
+
+    validate_pd_cache_provider(
+        disaggregation, cache_service.provider_name, role=declaration.role
+    )
 
     provider = await get_cache_provider(session, cache_service.provider_name)
     backend = declaration.backend or BackendEnum.VLLM.value
@@ -2110,6 +1360,9 @@ async def _validate_one_cache_declaration(
             )
         )
 
+    # PD engine ranges are advisory for explicit versions so operators can
+    # deploy images with their own connector fixes. Standalone cache users
+    # still follow the provider integration's version contract.
     # A pinned engine version below an integration's declared floor would
     # receive injected args the engine does not accept (e.g.
     # --shutdown-timeout) and fail to start. Reject when the version
@@ -2117,7 +1370,7 @@ async def _validate_one_cache_declaration(
     # versions fail open, and an unpinned version is resolved at deploy
     # time (the injection resolver re-checks it there).
     engine_version = declaration.backend_version
-    if engine_version:
+    if engine_version and not disaggregation:
         candidates = (
             [provider.integration_for(backend, framework) for framework in frameworks]
             if frameworks
@@ -2264,7 +1517,10 @@ async def _validate_model_spec(
     Mutates ``model_in`` in place: LoRA names are normalized to the stored
     ``<base>:<short>`` form and the scaling-schedule baseline is applied.
     """
-    await validate_model_in(session, model_in)
+    model_in.scaling_schedule = _preserve_scaling_schedule_pause(
+        model_in.scaling_schedule, allow_override=True
+    )
+    await validate_model_in(session, model_in, owner_principal_id=target_org_id)
     # Server-side assignment, after validation: validation must see the replica
     # count the caller submitted, not the schedule-driven one.
     apply_scaling_schedule_baseline(model_in)
@@ -2435,6 +1691,13 @@ async def _create_model_route(
 async def create_model(
     session: SessionDep, ctx: TenantContextDep, model_in: ModelCreate
 ):
+    if model_in.cluster_id is None:
+        # The column is NOT NULL, so an omitted cluster_id would only surface
+        # after the insert fails, as a bare 500. The requirement lives on this
+        # route rather than the schema because import entries share
+        # ModelCreate and resolve their cluster by name during import
+        # planning, which can legitimately parse without one.
+        raise BadRequestException(message="cluster_id is required to create a model")
     target_org_id, cluster = await _resolve_target_org(
         ctx, session, model_in.cluster_id
     )
@@ -3059,6 +2322,11 @@ async def _persist_model_update(
     before = deployment_spec(existing)
     patch = {field: getattr(model_in, field) for field in OVERWRITABLE_FIELDS}
     patch["cluster_id"] = model_in.cluster_id
+    patch["scaling_schedule"] = _preserve_scaling_schedule_pause(
+        model_in.scaling_schedule, existing
+    )
+    if patch["scaling_schedule"] and patch["scaling_schedule"].paused:
+        patch["replicas"] = 0
     await ModelService(session).update(existing, patch, auto_commit=False)
     await record_update(session, existing, before, latest, created_by)
 
@@ -3193,6 +2461,23 @@ async def save_model_update(
     return model
 
 
+def _validate_categories_update(model_in: ModelUpdate, stored: Model) -> None:
+    """The update-side half of the categories whitelist: an unchanged echo
+    of the stored row passes — including legacy free-form values the column
+    predating the whitelist can hold, which internal whole-object PUTs
+    (workers persisting ``backend_version``, the UI) round-trip on every
+    write — while a change is held to ``CategoryEnum`` exactly like create.
+    """
+    if "categories" not in model_in.model_fields_set:
+        return
+    if model_in.categories == stored.categories:
+        return
+    known = {e.value for e in CategoryEnum}
+    for category in model_in.categories or []:
+        if category not in known:
+            raise BadRequestException(message=f"Invalid category: {category}")
+
+
 async def _apply_model_update(
     session: AsyncSession, ctx: TenantContext, model: Model, model_in: ModelUpdate
 ) -> Model:
@@ -3203,6 +2488,7 @@ async def _apply_model_update(
     await assert_cluster_belongs_to_org(
         ctx, session, model_in.cluster_id, model.owner_principal_id
     )
+    _validate_categories_update(model_in, model)
 
     # Runtime settings belong to their backend. Validate a backend switch
     # against its replacement settings, while preserving fields explicitly
@@ -3246,6 +2532,12 @@ async def _apply_model_update(
         if field not in fields_set:
             object.__setattr__(model_in, field, getattr(model, field))
 
+    # Workers report runtime versions through whole-object PUTs; their stale
+    # schedule snapshot must not change an operator's execution state.
+    user_kind = getattr(getattr(ctx, "user", None), "kind", None)
+    _merge_scaling_schedule_update(
+        model_in, model, allow_pause_override=user_kind != PrincipalType.SYSTEM
+    )
     await validate_model_in(session, model_in, stored=model)
     # Server-side assignment, after validation: validation must see the replica
     # count the caller submitted, not the schedule-driven one.
@@ -3255,6 +2547,7 @@ async def _apply_model_update(
         model_in,
         model.owner_principal_id,
         model_in.cluster_id or model.cluster_id,
+        stored=model,
     )
 
     await ModelService(session).update(model, model_in, auto_commit=False)
@@ -3272,50 +2565,31 @@ async def _apply_model_update(
     return model
 
 
-class ModelRestartResult(BaseModel):
-    """What a restart request did, so the caller can tell "converged" from
-    "nothing to do" without a second read."""
+@router.post(
+    "/{id}/restart",
+    response_model=ModelRestartResult,
+    responses={202: {"model": ModelRestartResult}},
+)
+async def restart_model(
+    session: SessionDep, ctx: TenantContextDep, id: int, response: Response = None
+):
+    """Restart all instances on the current deployment configuration.
 
-    spec_digest: str
-    """The generation the group is being brought onto."""
-    restarted: bool
-    deleted_instances: List[str] = []
-    message: Optional[str] = None
+    PD deployments persist parent restart and child drain requests in one
+    transaction. Replica convergence retires the old rows only after the
+    managed manifests confirm that every old task stopped. Ordinary deployments
+    delete their instance records and clean up tasks through Worker events.
 
-
-@router.post("/{id}/restart", response_model=ModelRestartResult)
-async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
-    """Retire the running generation so the current spec takes effect.
-
-    Atomic by construction, and that is the point rather than an optimisation.
-    "Restart" has until now meant deleting an instance and letting replica
-    convergence rebuild it, which for a group produces a window holding a
-    new-generation prefill beside an old-generation decode — and the engines do
-    not reject that pairing. A `max_model_len` mismatch handshakes, transfers,
-    and only fails on a long prompt, after prefill has already been paid for.
-    So the whole generation stops before any of it starts again.
-
-    There is deliberately no role parameter. "Restart only the decodes" is the
-    request that produces exactly the cross-generation window above, and the
-    strongest way to reject it is to have no way to express it.
-
-    Not idempotent, deliberately. A group already wholly on the current spec is
-    still torn down and rebuilt: "restart" is the word this operation is
-    offered under, and the state an operator reaches for it in — a process
-    wedged behind a socket while the control plane still calls it RUNNING — is
-    precisely the one no digest comparison can detect. `restarted` is
-    therefore true whenever there was anything to tear down, and
-    `deleted_instances` says what that was.
-
-    A restart still in flight is a 409 — the members are mid-replacement and a
-    second teardown would delete the replacements. That is recorded on the
-    model (`restarting_since`) rather than inferred from the rows: see
-    `_restart_in_flight`, and the field's own note for why the digest
-    comparison this replaces could never fire.
-
-    """
-    model = await Model.one_by_id(session, id)
+    The response acknowledges an accepted managed restart with an empty
+    deleted_instances list and a message explaining the pending stop barrier.
+    Repeated requests cannot retire replacements while old managed rows still
+    carry stop requests. There is no role-specific restart parameter."""
+    model = await Model.one_by_id(session, id, for_update=True)
     assert_resource_visible(ctx, model, not_found_message="Model not found")
+    if model.deleted_at is not None:
+        raise ConflictException(
+            message="The model is being deleted; wait for its workloads to stop."
+        )
 
     target = await model_spec_digest(session, model)
     instances = await ModelInstance.all_by_fields(
@@ -3326,10 +2600,13 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
         return ModelRestartResult(
             spec_digest=target,
             restarted=False,
+            completed=True,
+            phase="completed",
+            observe_url=f"/v2/models/{id}",
             message="No instances to restart; the model has none running.",
         )
 
-    if _restart_in_flight(model):
+    if _restart_in_flight(model, instances):
         # Tearing down again here would delete the replacements the previous
         # restart just created, and cost the group a second full startup.
         raise ConflictException(
@@ -3342,6 +2619,29 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
         for instance in instances
         if instance.state == ModelInstanceStateEnum.ERROR
     ]
+
+    if any(requires_model_instance_stop_barrier(instance) for instance in instances):
+        try:
+            await ModelService(session).stop_instances(
+                model, instances, {"restarting_since": datetime.now(timezone.utc)}
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise InternalServerErrorException(
+                message=f"Failed to restart model: {exc}"
+            )
+        if response is not None:
+            response.status_code = 202
+        return ModelRestartResult(
+            completed=False,
+            phase="restarting",
+            observe_url=f"/v2/models/{id}",
+            spec_digest=target,
+            restarted=True,
+            deleted_instances=[],
+            message="Restart accepted; waiting for all old workloads to stop before rebuilding.",
+        )
 
     # No short-circuit on a converged group. Returning `restarted: false`
     # when the members already carry the target digest reads as "converge to
@@ -3372,6 +2672,7 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
     await ModelService(session).update(
         model, {"restarting_since": datetime.now(timezone.utc)}
     )
+    restart_started = model.restarting_since
 
     try:
         deleted = await ModelInstanceService(session).batch_delete(list(instances))
@@ -3380,14 +2681,25 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
         # reason to make the operator wait out the lapse. Released explicitly
         # rather than left to expire: the failure they now have to retry is the
         # worst moment to answer the retry with a 409.
-        await ModelService(session).update(model, {"restarting_since": None})
+        # Rollback expires model attributes and releases the original row lock.
+        # A later request may own a different guard by the time we read it again.
+        current = await Model.one_by_id(session, id, for_update=True, refresh=True)
+        if current is not None and current.restarting_since == restart_started:
+            await ModelService(session).update(current, {"restarting_since": None})
+        if isinstance(e, HTTPException):
+            raise
         raise InternalServerErrorException(message=f"Failed to restart model: {e}")
 
     # Rebuilding is left to replica convergence rather than done here: it is
     # the one place that knows a group forms its GPU roles atomically and holds
     # the router back until they run, and duplicating that here would be a
     # second implementation of the rule that matters most.
+    if response is not None:
+        response.status_code = 202
     return ModelRestartResult(
+        completed=False,
+        phase="restarting",
+        observe_url=f"/v2/models/{id}",
         spec_digest=target,
         restarted=True,
         deleted_instances=deleted,
@@ -3395,27 +2707,23 @@ async def restart_model(session: SessionDep, ctx: TenantContextDep, id: int):
     )
 
 
-def _restart_in_flight(model: Model) -> bool:
-    """Whether a previous restart is still rebuilding this deployment.
+def _restart_in_flight(
+    model: Model, instances: Optional[List[ModelInstance]] = None
+) -> bool:
+    """Whether a restart still protects old tasks or their replacements.
 
-    Read off `Model.restarting_since`, which the status pass clears on RUNNING.
-    Two things it is deliberately not:
-
-    - **Not a digest comparison.** The teardown is synchronous and the reconcile
-      rebuilds from the same target digest, so the generations never coexist and
-      `len(digests) > 1` — the test this replaces — was never true. What it was
-      written to prevent happened anyway, measured: a second click 4.5s after
-      the first deleted the three replacements the first had just created.
-    - **Not "the group is not RUNNING".** That would refuse the restart of a
-      group wedged in `starting`, which is the state operators reach for this
-      endpoint in and the reason its no-op short-circuit was removed.
-
-    The lapse makes the refusal bounded. A restart that never converges must not
-    become a deployment that can never be restarted.
-    """
+    Managed rows with a stop request retain the guard until their stop barrier
+    is retired, regardless of elapsed time. After that, replacement startup
+    uses the bounded guard until the status controller releases it."""
     since = model.restarting_since
     if since is None:
         return False
+    if any(
+        get_model_instance_workloads(instance) is not None
+        and instance.draining_since is not None
+        for instance in instances or []
+    ):
+        return True
     if since.tzinfo is None:
         since = since.replace(tzinfo=timezone.utc)
     age = (datetime.now(timezone.utc) - since).total_seconds()
@@ -3438,11 +2746,16 @@ def _restart_message(failed: List[str]) -> str:
 
 @router.delete(
     "/{id}",
+    response_model=None,
+    responses={202: {"description": "Cleanup is pending"}},
 )
-async def delete_model(session: SessionDep, ctx: TenantContextDep, id: int):
+async def delete_model(
+    session: SessionDep, ctx: TenantContextDep, id: int, response: Response = None
+) -> None:
     model = await Model.one_by_id(
         session,
         id,
+        for_update=True,
         options=[
             selectinload(Model.instances),
             selectinload(Model.model_route_targets),
@@ -3451,6 +2764,10 @@ async def delete_model(session: SessionDep, ctx: TenantContextDep, id: int):
     assert_resource_visible(ctx, model, not_found_message="Model not found")
 
     try:
-        await ModelService(session).delete(model)
+        completed = await ModelService(session).delete(model)
+    except HTTPException:
+        raise
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to delete model: {e}")
+    if response is not None and not completed:
+        response.status_code = 202

@@ -3,10 +3,15 @@ import os
 import shlex
 from typing import Dict, List, Optional, Tuple
 
-from gpustack.schemas.models import ModelInstanceDeploymentMetadata
+from gpustack.schemas.models import (
+    ModelInstanceDeploymentMetadata,
+    find_role,
+    role_backend_field,
+)
 from gpustack.utils.command import format_backend_parameters
 from gpustack.utils.envs import sanitize_env
 from gpustack.worker.backends.base import InferenceServer
+from gpustack.worker.pd_router import is_managed_router
 
 from gpustack_runtime.deployer import (
     Container,
@@ -19,6 +24,31 @@ from gpustack_runtime.deployer import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A router needs descriptors for both incoming and backend connections.
+_MANAGED_ROUTER_COMMAND_SCRIPT = r"""#!/bin/sh
+# Linux runner shells support soft/hard nofile flags.
+# shellcheck disable=SC3045
+set -e
+
+target=65536
+soft=$(ulimit -Sn)
+hard=$(ulimit -Hn)
+if [ "$hard" != unlimited ] && [ "$hard" -lt "$target" ]; then
+    echo "Warning: PD router nofile hard limit $hard is below $target;" \
+        "using the hard limit." >&2
+    target=$hard
+fi
+if [ "$soft" != unlimited ] && [ "$soft" -lt "$target" ]; then
+    if ! ulimit -Sn "$target"; then
+        echo "Failed to raise PD router nofile soft limit from $soft to $target" \
+            "(hard=$hard)." >&2
+        exit 1
+    fi
+fi
+echo "PD router nofile limits: soft=$(ulimit -Sn), hard=$(ulimit -Hn)" >&2
+exec "$@"
+"""
 
 
 class CustomServer(InferenceServer):
@@ -55,7 +85,10 @@ class CustomServer(InferenceServer):
         env = self._get_configured_env()
 
         command = None
-        if self.inference_backend:
+        launch = getattr(self, '_router_launch', None)
+        if launch is not None:
+            command = launch.entrypoint
+        elif self.inference_backend:
             command = self.inference_backend.get_container_entrypoint(
                 self._model.backend_version
             )
@@ -69,7 +102,8 @@ class CustomServer(InferenceServer):
             )
         except Exception as e:
             logger.warning(
-                f"Failed to persist injected backend parameters for {self._model_instance.name}: {e}"
+                "Failed to persist injected backend parameters for "
+                f"{self._model_instance.name}: {e}"
             )
 
         self._create_workload(
@@ -98,6 +132,54 @@ class CustomServer(InferenceServer):
 
         # Read container config from environment variables
         container_config = self._get_container_env_config(env)
+
+        role_name = getattr(self._model_instance, "role", None)
+        source_model = self._model_spec or self._model
+        role = find_role(source_model, role_name)
+        # Read image overrides before rendering fills in the default runner image.
+        # Deployment and role images may not contain a shell.
+        managed_router = is_managed_router(
+            source_model, role_name, getattr(self, 'inference_backend', None)
+        )
+        launch = getattr(self, '_router_launch', None)
+        backend_command = bool(launch and launch.uses_backend_command)
+        image_overridden = bool(
+            role_backend_field(role, "image_name", source_model.image_name)
+            if role
+            else source_model.image_name
+        )
+        if (
+            managed_router
+            and role
+            and role.backend
+            and getattr(self, 'inference_backend', None)
+        ):
+            configured_image, _ = self.inference_backend.get_image_name(
+                self._model.backend_version
+            )
+            image_overridden = image_overridden or bool(configured_image)
+        if managed_router and not backend_command and image_overridden and not command:
+            if not command_args:
+                raise ValueError("Managed PD router requires an explicit command")
+            # A Router template is a complete command. Override an upstream
+            # image's application ENTRYPOINT instead of passing it another
+            # executable as a positional argument. No shell is needed.
+            command, command_args = command_args[:1], command_args[1:]
+        if managed_router and not backend_command and not image_overridden:
+            if not command and not command_args:
+                raise ValueError("Managed PD router requires an explicit command")
+            router_command = [
+                "/bin/sh",
+                "-c",
+                _MANAGED_ROUTER_COMMAND_SCRIPT,
+                "gpustack-pd-router",
+            ]
+            if command:
+                command_args = command + command_args
+                command = router_command
+            else:
+                # Keep the image's init entrypoint in front of the router.
+                command_args = router_command + command_args
 
         run_container = Container(
             image=image,
@@ -155,21 +237,44 @@ class CustomServer(InferenceServer):
     ) -> Tuple[List[str], List[str]]:
         command_args = []
 
-        selected_gpu_indexes = sorted(d.index for d in self._get_selected_gpu_devices())
+        source_model = getattr(self, "_model_spec", None) or self._model
+        if is_managed_router(
+            source_model,
+            getattr(self._model_instance, "role", None),
+            getattr(self, 'inference_backend', None),
+        ):
+            # Router commands have already been rendered into quoted argv.
+            # Substituting again would interpret template-looking runtime data.
+            command_args = shlex.split(self._model.run_command or "")
+            from gpustack.utils.pd_router_launch import resolve_router_launch
 
-        command_args_inline = self.inference_backend.replace_command_param(
-            version=self._model.backend_version,
-            model_path=self._model_path,
-            port=self._get_serving_port(),
-            worker_ip=self._worker.ip,
-            model_name=self._model.name,
-            gpu_count=len(selected_gpu_indexes),
-            gpu_ids=selected_gpu_indexes,
-            command=self._model.run_command,
-            env=self._model.env,
-        )
-        if command_args_inline:
-            command_args = shlex.split(command_args_inline)
+            launch = getattr(self, '_router_launch', None) or resolve_router_launch(
+                source_model, getattr(self, 'inference_backend', None)
+            )
+            # Parameters are appended below; they cannot replace a full Router
+            # invocation. Backend-defined commands retain their entrypoint/args contract.
+            if not launch.uses_backend_command and (
+                not command_args or not command_args[0]
+            ):
+                raise ValueError("Managed PD router requires an explicit command")
+        else:
+            selected_gpu_indexes = sorted(
+                d.index for d in self._get_selected_gpu_devices()
+            )
+
+            command_args_inline = self.inference_backend.replace_command_param(
+                version=self._model.backend_version,
+                model_path=self._model_path,
+                port=self._get_serving_port(),
+                worker_ip=self._worker.ip,
+                model_name=self._model.name,
+                gpu_count=len(selected_gpu_indexes),
+                gpu_ids=selected_gpu_indexes,
+                command=self._model.run_command,
+                env=self._model.env,
+            )
+            if command_args_inline:
+                command_args = shlex.split(command_args_inline)
 
         # Add user-defined backend parameters
         user_backend_parameters = self._flatten_backend_param()

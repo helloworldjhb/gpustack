@@ -24,6 +24,10 @@ from gpustack.schemas.models import (
     SourceEnum,
 )
 from gpustack.server.controllers import (
+    _first_resolved_path,
+    _refresh_instance_download_progress,
+    _sync_main_worker_ready,
+    _sync_subordinate_worker,
     sync_distributed_model_file_state,
     sync_main_worker_model_file_state,
 )
@@ -75,6 +79,28 @@ def _distributed_instance(sub_download_progress: Optional[float]) -> ModelInstan
         _model_file(20, SUB_WORKER_ID, ModelFileStateEnum.READY, ["/cache/sub"]),
     ]
     return instance
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('subordinate', [False, True])
+async def test_discarded_download_bytes_reduce_displayed_progress(subordinate):
+    instance = _distributed_instance(sub_download_progress=50)
+    instance.download_progress = 50
+    file = instance.model_files[1 if subordinate else 0]
+    file.state = ModelFileStateEnum.DOWNLOADING
+    file.download_progress = 30
+
+    if subordinate:
+        worker = instance.distributed_servers.subordinate_workers[0]
+        changed = await _sync_subordinate_worker(MagicMock(), instance, worker, file)
+        progress = worker.download_progress
+    else:
+        changed = _refresh_instance_download_progress(instance, file)
+        progress = instance.download_progress
+
+    assert changed
+    assert progress == 30
+    assert instance.state == ModelInstanceStateEnum.DOWNLOADING
 
 
 @contextlib.contextmanager
@@ -270,3 +296,162 @@ async def test_subordinate_loads_files_only_for_completion(
         subordinate = instance.distributed_servers.subordinate_workers[0]
         expected_progress = 100 if file_state == ModelFileStateEnum.READY else 99
         assert subordinate.download_progress == expected_progress
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('still_linked', [False, True])
+async def test_file_event_rechecks_association_after_managed_recovery(
+    monkeypatch, still_linked
+):
+    from gpustack.server import controllers
+    from gpustack.server.bus import Event, EventType
+
+    instance = _distributed_instance(sub_download_progress=0)
+    old_snapshot = instance.model_copy(deep=True)
+    file = instance.model_files[0]
+    set_committed_value(file, 'instances', [old_snapshot])
+    set_committed_value(file, 'draft_instances', [])
+    if not still_linked:
+        set_committed_value(instance, 'model_files', [])
+    session = MagicMock()
+
+    @contextlib.asynccontextmanager
+    async def session_context():
+        yield session
+
+    monkeypatch.setattr(controllers, 'async_session', session_context)
+    monkeypatch.setattr(ModelFile, 'one_by_id', AsyncMock(return_value=file))
+    load = AsyncMock(return_value=instance)
+    monkeypatch.setattr(ModelInstance, 'one_by_id_with_model_files', load)
+    sync = AsyncMock()
+    monkeypatch.setattr(controllers, 'sync_main_worker_model_file_state', sync)
+
+    await controllers.ModelFileController()._reconcile(Event(EventType.UPDATED, file))
+
+    load.assert_awaited_once_with(session, instance.id, for_update=True)
+    assert sync.await_count == int(still_linked)
+    if still_linked:
+        sync.assert_awaited_once_with(session, file, instance)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('retired', [False, True])
+async def test_file_preparation_checks_generation_under_lock(monkeypatch, retired):
+    from gpustack.server import controllers
+
+    instance = _distributed_instance(sub_download_progress=0)
+    instance.state = ModelInstanceStateEnum.INITIALIZING
+    event = instance.model_copy(deep=True)
+    if retired:
+        instance.restart_count = (instance.restart_count or 0) + 1
+    load = AsyncMock(return_value=instance)
+    monkeypatch.setattr(ModelInstance, 'one_by_id', load)
+    monkeypatch.setattr(Model, 'one_by_id', AsyncMock(return_value=None))
+    sync = AsyncMock()
+    monkeypatch.setattr(controllers, 'sync_instance_files_state', sync)
+    await controllers.ensure_instance_model_file(MagicMock(), event)
+    assert sync.await_count == int(not retired)
+    assert load.await_args.kwargs.get('for_update') is True
+    assert load.await_args.kwargs.get('refresh') is True
+
+
+@pytest.mark.asyncio
+async def test_file_sync_rechecks_generation_after_each_commit(monkeypatch):
+    from gpustack.server import controllers
+
+    instance = _distributed_instance(sub_download_progress=0)
+    files = list(instance.model_files)
+    expected = instance.restart_count or 0
+
+    async def load(*args, **kwargs):
+        return instance
+
+    monkeypatch.setattr(
+        ModelInstance, 'one_by_id_with_model_files', AsyncMock(side_effect=load)
+    )
+
+    async def recover(*args, **kwargs):
+        instance.restart_count = expected + 1
+
+    primary = AsyncMock(side_effect=recover)
+    subordinate = AsyncMock()
+    monkeypatch.setattr(controllers, 'sync_main_worker_model_file_state', primary)
+    monkeypatch.setattr(controllers, 'sync_distributed_model_file_state', subordinate)
+    await controllers.sync_instance_files_state(MagicMock(), instance, files)
+    primary.assert_awaited_once()
+    subordinate.assert_not_awaited()
+
+
+def test_first_resolved_path_skips_mmproj():
+    # The primary resolved path feeds `-m`; projector files must never be
+    # picked even when they lead the list (stale or reordered records).
+    file = _model_file(
+        10,
+        MAIN_WORKER_ID,
+        ModelFileStateEnum.READY,
+        [
+            "/cache/model_scope/ggml-org/vllm-d3-mini-GGUF/mmproj-vllm-d3-mini-Q8_0.gguf",
+            "/cache/model_scope/ggml-org/vllm-d3-mini-GGUF/vllm-d3-mini-BF16.gguf",
+        ],
+    )
+
+    assert (
+        _first_resolved_path([file])
+        == "/cache/model_scope/ggml-org/vllm-d3-mini-GGUF/vllm-d3-mini-BF16.gguf"
+    )
+
+
+@pytest.mark.asyncio
+async def test_main_worker_ready_picks_main_over_mmproj(monkeypatch):
+    from gpustack.server import controllers
+
+    instance = _distributed_instance(sub_download_progress=100)
+    instance.state = ModelInstanceStateEnum.DOWNLOADING
+    file = _model_file(
+        10,
+        MAIN_WORKER_ID,
+        ModelFileStateEnum.READY,
+        [
+            "/cache/mmproj-vllm-d3-mini-Q8_0.gguf",
+            "/cache/vllm-d3-mini-BF16.gguf",
+        ],
+    )
+
+    async def no_promote(session, instance):
+        return False
+
+    monkeypatch.setattr(controllers, '_promote_to_starting_if_complete', no_promote)
+
+    await _sync_main_worker_ready(MagicMock(), instance, file, False)
+
+    assert instance.resolved_path == "/cache/vllm-d3-mini-BF16.gguf"
+
+
+@pytest.mark.asyncio
+async def test_main_worker_ready_skips_update_when_only_mmproj_resolved(monkeypatch):
+    from gpustack.server import controllers
+
+    # A projector-only file list leaves resolved_path unset; the handler
+    # must not flag need_update, which would re-run the instance update on
+    # every subsequent READY sync.
+    instance = _distributed_instance(sub_download_progress=100)
+    instance.state = ModelInstanceStateEnum.DOWNLOADING
+    file = _model_file(
+        10,
+        MAIN_WORKER_ID,
+        ModelFileStateEnum.READY,
+        ["/cache/mmproj-vllm-d3-mini-Q8_0.gguf"],
+    )
+
+    async def no_promote(session, instance):
+        return False
+
+    monkeypatch.setattr(controllers, '_promote_to_starting_if_complete', no_promote)
+    monkeypatch.setattr(
+        controllers, '_refresh_instance_download_progress', lambda *a, **k: False
+    )
+
+    need_update = await _sync_main_worker_ready(MagicMock(), instance, file, False)
+
+    assert instance.resolved_path is None
+    assert need_update is False

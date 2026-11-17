@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.exc import IntegrityError
 from starlette.responses import StreamingResponse
 
+from gpustack.api.streaming import tenant_streaming
 from gpustack.api.exceptions import (
+    HTTPException as APIHTTPException,
     AlreadyExistsException,
     ConflictException,
     InternalServerErrorException,
@@ -92,10 +94,12 @@ async def get_gpu_instance_persistent_volume_types(
 
     if params.watch:
         return StreamingResponse(
-            GPUInstancePersistentVolumeType.streaming(
+            tenant_streaming(
+                GPUInstancePersistentVolumeType,
+                ctx,
                 fields={},
                 fuzzy_fields=fuzzy_fields,
-                filter_func=filter_func,
+                visibility_filter=filter_func,
             ),
             media_type="text/event-stream",
         )
@@ -280,6 +284,8 @@ def is_manageable(obj, ctx: TenantContext) -> bool:
 async def handle_error(message: str):
     try:
         yield
+    except APIHTTPException:
+        raise
     except IntegrityError as e:
         # ``ON DELETE RESTRICT`` from
         # gpu_instance_persistent_volumes.persistent_volume_type_id

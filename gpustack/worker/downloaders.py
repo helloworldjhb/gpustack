@@ -2,11 +2,12 @@ import fnmatch
 import logging
 import modelscope
 import os
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 from packaging.version import Version
 from tqdm.contrib.concurrent import thread_map
 
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import tqdm as hf_tqdm
 from modelscope.hub.api import HubApi
 from modelscope.hub.snapshot_download import (
     snapshot_download as modelscope_snapshot_download,
@@ -16,6 +17,7 @@ from modelscope.hub.utils.utils import model_id_to_group_owner_name
 from gpustack.schemas.models import Model, ModelSource, SourceEnum, get_mmproj_filename
 from gpustack.utils import file
 from gpustack.utils.hub import (
+    is_mmproj_repo_path,
     match_hugging_face_files,
     match_model_scope_file_paths,
     select_most_suitable_extra_file,
@@ -26,12 +28,27 @@ from gpustack.utils.locks import HeartbeatSoftFileLock
 logger = logging.getLogger(__name__)
 
 
+class HfDownloadProgress(hf_tqdm):
+    """Identify file progress separately from Xet network transfer progress."""
+
+    def __init__(self, *args, **kwargs):
+        self._gpustack_track_download = not (kwargs.get('name') or '').endswith(
+            '.transfer'
+        )
+        self._gpustack_xet_download = (kwargs.get('name') or '').startswith(
+            'huggingface_hub.xet_get'
+        )
+        super().__init__(*args, **kwargs)
+
+
 def download_model(
     model: ModelSource,
     local_dir: Optional[str] = None,
     cache_dir: Optional[str] = None,
     huggingface_token: Optional[str] = None,
     model_scope_files: Optional[List[str]] = None,
+    huggingface_progress: Optional[Callable[[str, int], None]] = None,
+    huggingface_cancel_check: Optional[Callable[[], None]] = None,
 ) -> List[str]:
     if model.source == SourceEnum.HUGGING_FACE:
         return HfDownloader.download(
@@ -42,6 +59,8 @@ def download_model(
             local_dir=local_dir,
             cache_dir=os.path.join(cache_dir, "huggingface"),
             owner_worker_id=getattr(model, "worker_id", None),
+            progress_callback=huggingface_progress,
+            cancel_check=huggingface_cancel_check,
         )
     elif model.source == SourceEnum.MODEL_SCOPE:
         return ModelScopeDownloader.download(
@@ -84,28 +103,41 @@ def get_model_file_info(
 def select_model_scope_file_info(
     files: List[FileEntry], model: ModelSource
 ) -> List[FileEntry]:
-    """Select the ModelScope files used for size, progress, and download."""
+    """Select the ModelScope files used for size, progress, and download.
+
+    Main files come first and the mmproj extra file is appended last, so
+    downstream consumers that take the first entry (e.g. resolved_path)
+    always see a main-model file."""
     by_path = {
         file.rfilename: file
         for file in files
         if file.rfilename and file.file_type != 'tree'
     }
     if not model.model_scope_file_path:
-        return [by_path[path] for path in sorted(by_path)]
+        main_paths = [p for p in sorted(by_path) if not is_mmproj_repo_path(p)]
+        extra_paths = [p for p in sorted(by_path) if is_mmproj_repo_path(p)]
+        return [by_path[p] for p in main_paths + extra_paths]
 
     selected = {
         path for path in by_path if fnmatch.fnmatch(path, model.model_scope_file_path)
     }
     if not selected:
         return []
+
+    def _partition(paths: List[str]) -> List[str]:
+        return sorted(p for p in paths if not is_mmproj_repo_path(p)) + sorted(
+            p for p in paths if is_mmproj_repo_path(p)
+        )
+
     extra_pattern = get_mmproj_filename(model)
     if extra_pattern:
         extra = select_most_suitable_extra_file(
             [path for path in by_path if fnmatch.fnmatch(path, extra_pattern)]
         )
         if extra:
-            selected.add(extra)
-    return [by_path[path] for path in sorted(selected)]
+            selected.discard(extra)
+            return [by_path[p] for p in _partition(list(selected))] + [by_path[extra]]
+    return [by_path[p] for p in _partition(list(selected))]
 
 
 class HfDownloader:
@@ -130,6 +162,8 @@ class HfDownloader:
         cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
         max_workers: int = 8,
         owner_worker_id: Optional[int] = None,
+        progress_callback: Optional[Callable[[str, int], None]] = None,
+        cancel_check: Optional[Callable[[], None]] = None,
     ) -> List[str]:
         """Download a model from the Hugging Face Hub.
 
@@ -145,6 +179,10 @@ class HfDownloader:
             max_workers (`int`, *optional*):
                 Number of concurrent threads to download files (1 thread = 1 file download).
                 Defaults to 8.
+            progress_callback:
+                Report each repo-relative file's current valid byte count.
+            cancel_check:
+                Raise when the download has been cancelled.
 
         Returns:
             The paths to the downloaded model files.
@@ -165,6 +203,8 @@ class HfDownloader:
                     token=token,
                     local_dir=local_dir,
                     extra_filename=extra_filename,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
                 )
 
             # huggingface_hub>=1.0 snapshot_download aggregates per-file progress
@@ -177,6 +217,8 @@ class HfDownloader:
                 token=token,
                 local_dir=local_dir,
                 max_workers=max_workers,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
             )
             return [local_dir]
 
@@ -189,6 +231,8 @@ class HfDownloader:
         local_dir: Optional[Union[str, os.PathLike[str]]] = None,
         max_workers: int = 8,
         extra_filename: Optional[str] = None,
+        progress_callback: Optional[Callable[[str, int], None]] = None,
+        cancel_check: Optional[Callable[[], None]] = None,
     ) -> List[str]:
         """Download a model from the Hugging Face Hub.
         Args:
@@ -196,10 +240,14 @@ class HfDownloader:
             filename: A filename or glob pattern to match the model file in the repo.
             token: The Hugging Face API token.
             local_dir: The local directory to save the model to.
+            progress_callback: Report each file's current valid byte count.
+            cancel_check: Raise when the download has been cancelled.
         Returns:
             The path to the downloaded model.
         """
 
+        if cancel_check is not None:
+            cancel_check()
         matching_files = match_hugging_face_files(
             repo_id, filename, extra_filename, token
         )
@@ -212,12 +260,46 @@ class HfDownloader:
         # Pass full repo-relative paths so files from mixed directories
         # (e.g. weights in a subfolder + mmproj at repo root) all download.
         def _inner_hf_hub_download(repo_file: str) -> str:
-            return hf_hub_download(
-                repo_id=repo_id,
-                filename=repo_file,
-                token=token,
-                local_dir=local_dir,
-            )
+            if cancel_check is not None:
+                cancel_check()
+
+            def report(downloaded: int):
+                if progress_callback is not None:
+                    progress_callback(repo_file, downloaded)
+
+            class FileProgress(HfDownloadProgress):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    if cancel_check is not None:
+                        cancel_check()
+                    if self._gpustack_track_download:
+                        report(self.n)
+
+                def update(self, n=1):
+                    result = super().update(n)
+                    if self._gpustack_track_download:
+                        report(self.n)
+                    return result
+
+            try:
+                path = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=repo_file,
+                    token=token,
+                    local_dir=local_dir,
+                    tqdm_class=FileProgress,
+                )
+                if cancel_check is not None:
+                    cancel_check()
+                downloaded = os.path.getsize(path)
+            except BaseException:
+                # The SDK removes failed temporary files before propagating
+                # the error. Their bytes no longer contribute to completion.
+                report(0)
+                raise
+            # Cache hits need no tqdm bar, but still contribute valid bytes.
+            report(downloaded)
+            return path
 
         downloaded_files = thread_map(
             _inner_hf_hub_download,
@@ -227,7 +309,15 @@ class HfDownloader:
         )
 
         logger.info(f"Downloaded model {repo_id}/{filename}")
-        return sorted(downloaded_files)
+        # thread_map preserves the matching_files order. Keep main weights
+        # ahead of mmproj files so downstream first-entry consumers
+        # (resolved_path) always see a main-model file, even when the user
+        # pattern matched the projector too.
+        paths_by_file = dict(zip(matching_files, downloaded_files))
+        ordered_files = [f for f in matching_files if not is_mmproj_repo_path(f)] + [
+            f for f in matching_files if is_mmproj_repo_path(f)
+        ]
+        return [paths_by_file[f] for f in ordered_files]
 
     def __call__(self):
         return self.download()

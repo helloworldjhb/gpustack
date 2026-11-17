@@ -3,10 +3,13 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gpustack.schemas.clusters import Cluster
+from gpustack.schemas.config import ModelInstanceProxyModeEnum
 from gpustack.schemas.model_routes import ModelRoute, ModelRouteTarget, TargetStateEnum
 from gpustack.schemas.models import ModelInstanceStateEnum, RoleNameEnum, RoleSpec
+from gpustack.schemas.workers import Worker, WorkerStateEnum, WorkerStatus
 from gpustack.server.bus import Event, EventType
 from gpustack.server.controllers import (
+    WorkerController,
     calculate_destinations,
     notify_model_ai_proxy_change,
     notify_model_route_target,
@@ -251,7 +254,13 @@ async def test_all_zero_weight_targets_still_yield_destinations():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "changed_field, should_notify",
-    [("native_anthropic_api", True), ("replicas", True), ("description", False)],
+    [
+        ("native_anthropic_api", True),
+        ("replicas", True),
+        ("description", False),
+        ("worker_proxy_address", True),
+        ("worker_proxy_mode", True),
+    ],
 )
 async def test_native_anthropic_api_edit_reaches_the_route(
     changed_field, should_notify
@@ -287,6 +296,94 @@ async def test_native_anthropic_api_edit_reaches_the_route(
         )
 
     assert publish.await_count == (1 if should_notify else 0)
+
+
+class _NullSession:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *args):
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', ['proxy_address', 'state', 'unreachable', 'labels'])
+async def test_worker_recovery_fanout_wakes_models_and_rebuilds_tunnel_routes(field):
+    """A tunnel worker's proxy address coming back is the last event of the
+    outage ordering: the instances are RUNNING again and ``ready_replicas``
+    has already settled, so the fan-out from ``_notify_relatives`` is the
+    only trigger left that can rebuild the gateway route. The
+    route-target notification is made directly rather than riding the model
+    event, whose ``changed_fields`` the coordinator drops on the wire -- a
+    bare event is filtered out by ``notify_model_route_target`` and the
+    route stays missing indefinitely."""
+    worker = Worker(
+        id=1,
+        name="tunnel-worker",
+        state=WorkerStateEnum.READY,
+        hostname="host-b",
+        ip="10.0.0.2",
+        ifname="eth0",
+        port=10128,
+        worker_uuid="uuid-b",
+        status=WorkerStatus.get_default_status(),
+        proxy_mode=ModelInstanceProxyModeEnum.TUNNEL,
+        proxy_address="http://10.0.0.2:10129",
+    )
+    instance = new_model_instance(1, "instance-1", MODEL_ID, worker_id=1)
+    instance.model = _model()
+
+    publish = AsyncMock()
+    with (
+        patch(
+            "gpustack.server.controllers.async_session",
+            return_value=_NullSession(),
+        ),
+        patch(
+            "gpustack.server.controllers.ModelInstance.all_by_fields",
+            AsyncMock(return_value=[instance]),
+        ),
+        patch(
+            'gpustack.server.controllers.Model.all_by_fields',
+            AsyncMock(return_value=[_model()]),
+        ),
+        patch(
+            "gpustack.server.controllers.Model.one_by_id",
+            AsyncMock(return_value=_model()),
+        ),
+        patch(
+            "gpustack.server.controllers.ModelRouteTarget.all_by_fields",
+            AsyncMock(return_value=[_target(1)]),
+        ),
+        patch("gpustack.server.controllers.event_bus.publish", publish),
+    ):
+        controller = WorkerController.__new__(WorkerController)
+        await controller._notify_relatives(
+            Event(
+                type=EventType.UPDATED,
+                data=worker,
+                changed_fields={
+                    field: {
+                        'proxy_address': (None, worker.proxy_address),
+                        'state': (WorkerStateEnum.UNREACHABLE, WorkerStateEnum.READY),
+                        'unreachable': (True, False),
+                        'labels': ({}, {'env': 'test'}),
+                    }[field]
+                },
+            )
+        )
+
+    # One bare model event per model on the worker. The direct
+    # route-target notification only fires when it carries the synthetic
+    # ``worker_*`` fields; for a plain state or unreachable flip the bare
+    # model event alone reaches the route through the Model controller.
+    assert publish.await_count == (
+        2 if field == "proxy_address" else 0 if field == "labels" else 1
+    )
+    if field != 'labels':
+        assert publish.await_args_list[0].args[1].data.id == MODEL_ID
+    if field == 'proxy_address':
+        assert "model" in publish.await_args_list[1].args[1].changed_fields
 
 
 @pytest.mark.asyncio
@@ -392,3 +489,86 @@ async def test_group_without_a_running_router_weights_nothing():
 
     assert destinations == []
     assert fallback == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_registry_failure_does_not_block_existing_target_notification(
+    monkeypatch,
+):
+    from unittest.mock import MagicMock
+    from gpustack.server import controllers
+
+    order = []
+    monkeypatch.setattr(
+        controllers,
+        '_model_gateway_registry_inputs',
+        AsyncMock(return_value=([], {})),
+    )
+    monkeypatch.setattr(
+        controllers,
+        'notify_model_route_target',
+        AsyncMock(side_effect=lambda **kwargs: order.append('notify')),
+    )
+    monkeypatch.setattr(
+        controllers,
+        'sync_categories_and_meta',
+        AsyncMock(side_effect=lambda *args: order.append('categories')),
+    )
+
+    async def registry(**kwargs):
+        order.append('registry')
+        raise RuntimeError('MCP unavailable')
+
+    monkeypatch.setattr(controllers.mcp_handler, 'ensure_model_mcp_bridge', registry)
+    controller = controllers.ModelController.__new__(controllers.ModelController)
+    controller._disable_gateway = False
+    controller._config = MagicMock()
+    controller._higress_extension_api = object()
+    controller._higress_network_api = object()
+    controller._sync_model_ai_proxy = AsyncMock()
+    model = _model()
+    with pytest.raises(RuntimeError, match='MCP unavailable'):
+        await controller._sync_model_gateway(
+            None, model, Event(type=EventType.UPDATED, data=model)
+        )
+    assert order == ['notify', 'categories', 'registry']
+    controllers._model_gateway_registry_inputs.assert_awaited_once()
+    controller._sync_model_ai_proxy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_managed_rank_and_component_services_use_cluster_credentials(monkeypatch):
+    services = [
+        'model-5-1-dp0.static',
+        'model-5-1-dp1.static',
+        'model-5-2.static',
+    ]
+    captured = await _run_sync(
+        monkeypatch,
+        _model(),
+        [_target(1)],
+        destinations_by_override={None: _destinations(*services)},
+    )
+    (provider,) = captured['kwargs']['expected_providers']
+    (rule,) = captured['kwargs']['expected_match_rules']
+    assert provider['apiTokens'] == ['cluster-token']
+    assert sorted(rule.service) == sorted(services)
+    assert rule.config['activeProviderId'] == provider['id']
+
+
+@pytest.mark.asyncio
+async def test_missing_cluster_token_warns_without_exposing_credentials(
+    monkeypatch, caplog
+):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from gpustack.server.controllers import cluster_registration_tokens
+    from gpustack.schemas.clusters import Cluster
+
+    monkeypatch.setattr(
+        Cluster,
+        'one_by_id',
+        AsyncMock(return_value=SimpleNamespace(registration_token=None)),
+    )
+    assert await cluster_registration_tokens(MagicMock(), 1) == []
+    assert 'has no registration token' in caplog.text

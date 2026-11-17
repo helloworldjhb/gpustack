@@ -15,6 +15,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+from copy import deepcopy
+from functools import lru_cache
 from typing import Any, Dict, List
 
 import pytest
@@ -37,6 +39,7 @@ from gpustack.schemas.clusters import (
 from gpustack_runtime.detector import ManufacturerEnum
 
 HELM = shutil.which("helm")
+SAFE_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 # Anchored to the repository rather than the working directory, so `pytest` from
 # a subdirectory renders the same chart as `pytest` from the root.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -58,11 +61,23 @@ def config(**kwargs) -> TemplateConfig:
 def render(values: Dict[str, Any], namespace: str = "gpustack-system") -> List[dict]:
     if HELM is None or not chart_available():
         pytest.skip("helm or the packaged chart is unavailable")
+    # Serialize the complete input so different values and namespaces stay distinct.
+    return deepcopy(_render(yaml.safe_dump(values), namespace))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def render_cache():
+    yield
+    _render.cache_clear()
+
+
+@lru_cache(maxsize=None)
+def _render(values_yaml: str, namespace: str) -> List[dict]:
     # `tempfile` rather than the `mktemp` binary: its `-t` means a prefix on BSD
     # and a template on GNU, where a name without `XXXXXX` is refused outright —
     # so shelling out for it passes on a developer's macOS and fails on CI.
     with tempfile.NamedTemporaryFile("w", suffix=".yaml") as with_values:
-        yaml.safe_dump(values, with_values)
+        with_values.write(values_yaml)
         with_values.flush()
         result = subprocess.run(
             [
@@ -81,7 +96,7 @@ def render(values: Dict[str, Any], namespace: str = "gpustack-system") -> List[d
         )
     if result.returncode != 0:
         pytest.fail(f"helm template failed:\n{result.stderr}")
-    return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+    return [doc for doc in yaml.load_all(result.stdout, Loader=SAFE_YAML_LOADER) if doc]
 
 
 def worker_daemonset(docs: List[dict]) -> dict:
@@ -132,6 +147,55 @@ class TestSplitImageReference:
         # in the in-cluster Job's logs minutes later instead of in this response.
         with pytest.raises(ValueError, match="no tag"):
             build_chart_values(config(image="gpustack/gpustack"))
+
+
+class TestOperatorImage:
+    """The operator image has two consumers — the bootstrap Job and the chart —
+    and the release only matches the cluster when both resolve to the same
+    reference. The Job's image prefixes the cluster's registry, which may carry
+    a project path (a Harbor project, a Docker Hub namespace), so the chart's
+    values have to be resolved from that same prefixed reference."""
+
+    def test_the_cluster_registrys_project_path_reaches_the_values(self):
+        # Resolving from the raw operator image instead drops the project
+        # segment: the worker image's registry carries only the host, so the
+        # chart would deploy an operator one path short of what the Job ran.
+        cfg = config(
+            image="registry.example.com/project/gpustack/gpustack:dev",
+            k8s_options=K8sOptions(operator_image="gpustack/gpustack-operator:v0.10.0"),
+            system_default_container_registry="registry.example.com/project",
+        )
+        values = build_chart_values(cfg)
+        operator = values["gpustack-operator"]["image"]
+        assert operator["repository"] == "project/gpustack/gpustack-operator"
+        assert operator["tag"] == "v0.10.0"
+        assert (
+            values["gpustack-operator"]["global"]["imageRegistry"]
+            == "registry.example.com"
+        )
+
+    def test_a_fully_qualified_operator_image_is_untouched_by_the_cluster_registry(
+        self,
+    ):
+        cfg = config(
+            image="docker.io/gpustack/gpustack:dev",
+            k8s_options=K8sOptions(
+                operator_image=(
+                    "registry.example.com/project/gpustack/gpustack-operator:v0.10.0"
+                )
+            ),
+            system_default_container_registry="registry.example.com/project",
+        )
+        values = build_chart_values(cfg)
+        operator = values["gpustack-operator"]["image"]
+        assert operator["repository"] == "project/gpustack/gpustack-operator"
+        assert operator["tag"] == "v0.10.0"
+        # The reference names its own registry, which wins over the host
+        # mirrored from the worker image.
+        assert (
+            values["gpustack-operator"]["global"]["imageRegistry"]
+            == "registry.example.com"
+        )
 
 
 class TestGpuVendors:

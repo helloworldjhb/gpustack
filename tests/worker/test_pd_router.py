@@ -88,6 +88,28 @@ def test_the_catalog_router_renders_a_complete_command():
     assert plan.health_path == "/health"
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "vllm-nixl",
+        "vllm-mooncake",
+        "vllm-ascend-mooncake",
+        "sglang-mooncake",
+        "sglang-nixl",
+    ],
+)
+def test_prefill_reuses_prefixes_and_decode_rotates_workers(mode):
+    """The rendered policies keep prefix affinity on the prefill side."""
+    peers = {
+        "prefill": [PeerAddress("10.0.0.1", 40027, {"bootstrap": 40000})],
+        "decode": [PeerAddress("10.0.0.2", 40028)],
+    }
+    command = render_router(get_pd_mode(mode), VARIABLES, peers).command
+
+    assert command[command.index("--prefill-policy") + 1] == "cache_aware"
+    assert command[command.index("--decode-policy") + 1] == "round_robin"
+
+
 @pytest.mark.parametrize("mode", ["vllm-nixl", "vllm-ascend-mooncake"])
 def test_internal_lb_router_uses_one_http_upstream_per_member(mode):
     plan = render_router(get_pd_mode(mode), VARIABLES, PEERS)
@@ -99,6 +121,26 @@ def test_internal_lb_router_uses_one_http_upstream_per_member(mode):
             if arg == f"--{role}"
         ]
         assert urls == [f"http://{peer.ip}:{peer.port}" for peer in addresses]
+
+
+def test_mooncake_router_registers_peers_from_its_startup_command():
+    """Static membership needs the single router to consume its CLI peers."""
+    peers = {
+        "prefill": [PeerAddress("10.0.0.1", 40027, {"bootstrap": 40000})],
+        "decode": [PeerAddress("10.0.0.2", 40028)],
+    }
+    command = render_router(get_pd_mode("vllm-mooncake"), VARIABLES, peers).command
+
+    assert "--enable-igw" not in command
+    assert "--intra-node-data-parallel-size" not in command
+    assert "--vllm-pd-disaggregation" in command
+    assert command[command.index("--kv-connector") + 1] == "mooncake"
+    prefill_index = command.index("--prefill")
+    assert command[prefill_index + 1 : prefill_index + 3] == [
+        "http://10.0.0.1:40027",
+        "40000",
+    ]
+    assert command[command.index("--decode") + 1] == "http://10.0.0.2:40028"
 
 
 def test_the_routers_own_placeholders_resolve():
@@ -373,8 +415,7 @@ def test_a_role_less_model_is_untouched():
 
 
 def test_a_user_supplied_router_keeps_its_own_command():
-    """ "Managed" is derived from whether the user gave it an image and a
-    command, so a hand-written router cannot be overwritten by the catalog."""
+    """A full role command is executed without the catalog's invocation."""
     from gpustack.schemas.models import RoleSpec
     from gpustack.worker.pd_router import apply_managed_router, is_managed_router
 
@@ -386,8 +427,10 @@ def test_a_user_supplied_router_keeps_its_own_command():
             run_command="my-router --serve",
         )
     )
-    assert is_managed_router(model, "router") is False
-    assert apply_managed_router(model, "router") is model
+    assert is_managed_router(model, "router") is True
+    projected = apply_managed_router(model, "router", peers=PEERS, variables=VARIABLES)
+    assert projected.run_command == "my-router --serve"
+    assert projected.image_name == "me/my-router:1"
 
 
 def test_with_peers_the_command_is_materialised():
@@ -483,6 +526,44 @@ def test_the_runner_image_is_resolved_against_the_groups_engine():
         "the row this server was handed is the router's own — which is None"
     )
     assert variables["runner_image"] == "gpustack/runner:cuda12.9-vllm0.17.1"
+
+
+@pytest.mark.parametrize("version", [None, "0.30.0"])
+def test_router_image_resolution_uses_its_independent_backend(version):
+    from types import SimpleNamespace
+
+    from gpustack.schemas.models import RoleSpec, role_effective_model
+    from gpustack.schemas.pd_modes import PDNetDevicePlaneEnum
+    from gpustack.worker.backends.base import InferenceServer
+
+    model = _pd_model(
+        RoleSpec(name="router", backend="SGLang", backend_version=version)
+    )
+    model.image_name = "parent/vllm:custom"
+    asked = {}
+
+    def resolve_image(**kwargs):
+        asked.update(kwargs)
+        return "role/runner:image", version
+
+    fake = SimpleNamespace(
+        _worker=SimpleNamespace(ifname="eno1", name="node-a"),
+        _config=SimpleNamespace(kv_transfer_ifname=None),
+        _model_spec=model,
+        _model=role_effective_model(model, "router"),
+        _model_instance=SimpleNamespace(role="router"),
+        _resolve_image=resolve_image,
+        _engine_inference_backend=lambda spec: SimpleNamespace(
+            backend_name=spec.backend
+        ),
+        _net_device_plane=lambda: PDNetDevicePlaneEnum.DATA,
+    )
+    variables = InferenceServer._pd_template_variables(fake)
+
+    assert asked["backend"] == "SGLang"
+    assert asked["spec"].backend_version == version
+    assert asked["spec"].image_name is None
+    assert variables["runner_image"] == "role/runner:image"
 
 
 # --- which plane the derived NIC rides -------------------------------------- #
@@ -631,6 +712,79 @@ def test_a_role_image_survives_the_catalogs():
     # The catalog still supplies the invocation, peers included.
     assert projected.run_command.startswith("vllm-router ")
     assert "--prefill http://10.0.0.1:40027" in projected.run_command
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "vllm-nixl",
+        "vllm-mooncake",
+        "vllm-ascend-mooncake",
+        "sglang-nixl",
+        "sglang-mooncake",
+    ],
+)
+def test_image_only_custom_router_uses_runtime_peers_and_keeps_management(mode):
+    from gpustack.schemas.models import (
+        BackendEnum,
+        DisaggregationSpec,
+        RoleSpec,
+        role_effective_model,
+    )
+    from gpustack.validation.pd.roles import validate_roles
+    from gpustack.worker.pd_router import (
+        apply_managed_router,
+        is_managed_router,
+        managed_router_health_path,
+    )
+    from gpustack.utils.pd_router_membership import membership_update_policy
+
+    router = RoleSpec(
+        name="router",
+        backend=BackendEnum.CUSTOM,
+        image_name="upstream/router:compatible",
+    )
+    model = _pd_model(router)
+    model.backend = "SGLang" if mode.startswith("sglang-") else "vLLM"
+    model.disaggregation = DisaggregationSpec(mode=mode)
+    validate_roles(model)
+    assert is_managed_router(model, "router")
+    assert (
+        apply_managed_router(
+            role_effective_model(model, "router"), "router"
+        ).run_command
+        is None
+    )
+
+    peers = {
+        "prefill": [PeerAddress("10.0.0.11", 41001, {"bootstrap": 41002})],
+        "decode": [PeerAddress("10.0.0.12", 42001)],
+    }
+    launch = apply_managed_router(
+        role_effective_model(model, "router"),
+        "router",
+        peers=peers,
+        variables=VARIABLES,
+    )
+    assert launch.image_name == router.image_name
+    assert "--prefill http://10.0.0.11:41001" in launch.run_command
+    assert "--decode http://10.0.0.12:42001" in launch.run_command
+    assert managed_router_health_path(model, "router") == "/health"
+    assert (
+        membership_update_policy(model, get_pd_mode(mode))
+        == get_pd_mode(mode).router.membership_update
+    )
+    assert router.run_command is None
+
+    peers["decode"] = [PeerAddress("10.0.0.13", 43001)]
+    replacement = apply_managed_router(
+        role_effective_model(model, "router"),
+        "router",
+        peers=peers,
+        variables=VARIABLES,
+    )
+    assert "--decode http://10.0.0.13:43001" in replacement.run_command
+    assert "10.0.0.12:42001" not in replacement.run_command
 
 
 def test_a_role_command_survives_the_catalogs():
@@ -797,7 +951,8 @@ def test_a_router_env_placeholder_is_rendered_not_passed_through():
     assert plan.env["ADVERTISE"] == "192.168.50.15"
 
 
-def test_the_routers_own_parameters_are_appended_and_the_groups_are_not():
+@pytest.mark.parametrize("mode", ["vllm-nixl", "vllm-ascend-mooncake"])
+def test_the_routers_own_parameters_are_appended_and_the_groups_are_not(mode):
     """Two different things arrive in `backend_parameters` and only one is the
     router's.
 
@@ -810,7 +965,6 @@ def test_the_routers_own_parameters_are_appended_and_the_groups_are_not():
     from gpustack.schemas.models import (
         DisaggregationSpec,
         Model,
-        PDModeEnum,
         RoleSpec,
         SourceEnum,
     )
@@ -822,7 +976,7 @@ def test_the_routers_own_parameters_are_appended_and_the_groups_are_not():
             source=SourceEnum.HUGGING_FACE,
             huggingface_repo_id="org/repo",
             backend_parameters=["--max-model-len=8192"],
-            disaggregation=DisaggregationSpec(mode=PDModeEnum.VLLM_NIXL),
+            disaggregation=DisaggregationSpec(mode=mode),
             roles=[
                 RoleSpec(name="prefill", replicas=1),
                 RoleSpec(name="decode", replicas=1),
@@ -944,3 +1098,379 @@ def test_a_role_less_model_has_no_router_path():
         owner_principal_id=1,
     )
     assert managed_router_health_path(plain, None) is None
+
+
+def _static_hybrid_member(role, member_id, local_sizes=(2, 2)):
+    from gpustack.schemas.models import DistributedServers, PortBand
+    from tests.utils.model import new_hybrid_workload, new_model_instance
+
+    member = new_model_instance(
+        member_id,
+        f"member-{member_id}",
+        32,
+        worker_id=1,
+        state="running",
+        gpu_indexes=[0, 1],
+    )
+    member.role, member.group_id = role, "g"
+    member.worker_ip, member.port = "10.0.0.1", 8000 + member_id
+    member.named_ports = {"bootstrap": PortBand(base=9000 + member_id)}
+    tasks = []
+    for worker_id, local_dp in enumerate(local_sizes, 1):
+        fields = (
+            {"api_port": member.port, "dp_size": local_dp, "ready": True}
+            if local_dp is not None
+            else {}
+        )
+        tasks.append(
+            new_hybrid_workload(
+                worker_id,
+                state="running",
+                component={"kind": "vllm_hybrid", **fields},
+            )
+        )
+    member.distributed_servers = DistributedServers(
+        subordinate_workers=[
+            {"worker_id": i, "gpu_indexes": [0, 1]}
+            for i in range(2, len(local_sizes) + 1)
+        ],
+        workloads=tasks,
+    )
+    return member
+
+
+@pytest.mark.parametrize(
+    "prefill_sizes,decode_sizes,expected",
+    [((2, 2), (2,), 2), ((1, None, 1, None), (1, None), 1)],
+)
+def test_static_hybrid_router_uses_one_local_dp_for_all_actual_apis(
+    prefill_sizes, decode_sizes, expected
+):
+    from gpustack.schemas.models import PDModeEnum
+    from gpustack.worker.pd_router import static_hybrid_router_variables
+
+    model = _pd_model()
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    members = [
+        _static_hybrid_member("prefill", 1, prefill_sizes),
+        _static_hybrid_member("decode", 2, decode_sizes),
+    ]
+    for role, sizes in zip(model.roles, (prefill_sizes, decode_sizes)):
+        dp = sum(size or 0 for size in sizes)
+        role.backend_parameters = [
+            "--dph",
+            f"--dp={dp}",
+            f"--tp={2 * len(sizes) // dp}",
+            f"--dpl={expected}",
+        ]
+    other = _static_hybrid_member("prefill", 3, (8,))
+    other.group_id = "old"
+    assert static_hybrid_router_variables(model, [*members, other], "g") == {
+        "intra_node_data_parallel_size": expected
+    }
+
+
+@pytest.mark.parametrize('workloads', [None, []])
+def test_static_hybrid_router_rejects_endpoint_without_workload(monkeypatch, workloads):
+    from gpustack.schemas.models import PDModeEnum
+    from gpustack.utils import model_instance_workers
+    from gpustack.worker.pd_router import static_hybrid_router_variables
+
+    model = _pd_model()
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    instance = _static_hybrid_member('prefill', 1)
+    endpoints = model_instance_workers.model_instance_endpoints(instance)
+    monkeypatch.setattr(
+        model_instance_workers, 'model_instance_endpoints', lambda _: endpoints
+    )
+    instance.distributed_servers.workloads = workloads
+    instance.distributed_servers.orchestration_mode = (
+        "managed" if instance.distributed_servers.workloads is not None else "legacy"
+    )
+    with pytest.raises(ValueError, match='Hybrid endpoint.*Worker 1.*workload'):
+        static_hybrid_router_variables(model, [instance], 'g')
+
+
+@pytest.mark.parametrize("local_sizes", [(1, 1), (2, 4)])
+def test_static_hybrid_router_refuses_different_actual_api_scopes(local_sizes):
+    from gpustack.schemas.models import PDModeEnum
+    from gpustack.worker.pd_router import static_hybrid_router_variables
+
+    model = _pd_model()
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    members = [
+        _static_hybrid_member("prefill", 1),
+        _static_hybrid_member("decode", 2, local_sizes),
+    ]
+    with pytest.raises(ValueError, match="same local DP"):
+        static_hybrid_router_variables(model, members, "g")
+
+
+@pytest.mark.parametrize("global_dp", [2, 4])
+def test_static_hybrid_router_counts_internal_api_global_scope(global_dp):
+    from gpustack.schemas.models import PDModeEnum
+    from gpustack.worker.pd_router import static_hybrid_router_variables
+
+    model = _pd_model()
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    model.roles[1].backend_parameters = ["--dp", str(global_dp), "--tp", "1"]
+    decode = _static_hybrid_member("decode", 2)
+    decode.distributed_servers.workloads = None
+    decode.distributed_servers.orchestration_mode = "legacy"
+    if global_dp == 2:
+        assert static_hybrid_router_variables(
+            model, [_static_hybrid_member("prefill", 1), decode], "g"
+        ) == {"intra_node_data_parallel_size": 2}
+    else:
+        with pytest.raises(ValueError, match="same local DP"):
+            static_hybrid_router_variables(
+                model, [_static_hybrid_member("prefill", 1), decode], "g"
+            )
+
+
+def test_static_hybrid_router_keeps_original_role_scope_after_router_projection():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from gpustack.schemas.models import PDModeEnum, RoleSpec, role_effective_model
+    from gpustack.worker.backends.base import InferenceServer
+
+    model = _pd_model(RoleSpec(name="router", backend_parameters=["--port", "41000"]))
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    model.backend_parameters = ["--dp", "2", "--tp", "1"]
+    model.roles[0].backend_parameters = ["--dph", "--dp=4", "--dpl=2", "--tp=1"]
+    prefill = _static_hybrid_member("prefill", 1)
+    decode = _static_hybrid_member("decode", 2, (2,))
+    decode.distributed_servers.workloads = None
+    decode.distributed_servers.orchestration_mode = "legacy"
+    router = _static_hybrid_member("router", 3, ())
+    server = SimpleNamespace(
+        _model_spec=model,
+        _model_instance=router,
+        _clientset=SimpleNamespace(
+            model_instances=SimpleNamespace(list=lambda **_: [prefill, decode, router]),
+            workers=SimpleNamespace(get=lambda id: SimpleNamespace(ip=f"10.0.0.{id}")),
+        ),
+        _template_variables=lambda **_: dict(VARIABLES),
+        _pd_template_variables=lambda: {},
+        _update_model_instance=Mock(),
+    )
+    rendered = InferenceServer._apply_managed_router(
+        server, role_effective_model(model, "router")
+    )
+    assert "--intra-node-data-parallel-size 2" in rendered.run_command
+    assert rendered.backend_parameters == ["--port", "41000"]
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        None,
+        ["--intra-node-data-parallel-size", "2"],
+        ["--intra-node-data-parallel-size=2"],
+        ["--intra-node-data-parallel", "2"],
+        ["--intra-node-data-parallel-size 1 --intra-node-data-parallel-size 2"],
+    ],
+)
+def test_static_hybrid_router_renders_one_consistent_local_dp_flag(parameters):
+    from gpustack.schemas.models import PDModeEnum, RoleSpec
+    from gpustack.worker.pd_router import apply_managed_router
+
+    model = _pd_model(RoleSpec(name="router", backend_parameters=parameters))
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    peers = {
+        "prefill": [PeerAddress("10.0.0.1", 8001, {"bootstrap": 9001})],
+        "decode": [PeerAddress("10.0.0.2", 8002)],
+    }
+    projected = apply_managed_router(
+        model,
+        "router",
+        peers=peers,
+        variables={**VARIABLES, "intra_node_data_parallel_size": 2},
+    )
+    assert projected.run_command.split().count("--intra-node-data-parallel-size") == 1
+    assert "--intra-node-data-parallel-size 2" in projected.run_command
+    assert not projected.backend_parameters
+    assert model.roles[-1].backend_parameters == parameters
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        ["--intra-node-data-parallel-size", "1"],
+        ["--intra-node-data-parallel-size=4"],
+        ["--intra-node-data-parallel", "4"],
+        ["--intra-node-data-parallel-size"],
+        ["--intra-node-data-parallel-size", "bad"],
+    ],
+)
+def test_static_hybrid_router_refuses_conflicting_or_invalid_override(parameters):
+    from gpustack.schemas.models import PDModeEnum, RoleSpec
+    from gpustack.worker.pd_router import apply_managed_router
+
+    model = _pd_model(RoleSpec(name="router", backend_parameters=parameters))
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    with pytest.raises(ValueError, match="intra-node-data-parallel-size"):
+        apply_managed_router(
+            model,
+            "router",
+            peers=PEERS,
+            variables={**VARIABLES, "intra_node_data_parallel_size": 2},
+        )
+
+
+def test_static_hybrid_router_keeps_other_connection_parameters():
+    from gpustack.schemas.models import PDModeEnum, RoleSpec
+    from gpustack.worker.pd_router import apply_managed_router
+    from gpustack.utils.command import flatten_to_argv
+
+    model = _pd_model(
+        RoleSpec(
+            name="router",
+            backend_parameters=["--port", "41000", "--intra-node-data-parallel-size=2"],
+        )
+    )
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    rendered = apply_managed_router(
+        model,
+        "router",
+        peers=PEERS,
+        variables={**VARIABLES, "intra_node_data_parallel_size": 2},
+    )
+    assert flatten_to_argv(rendered.backend_parameters) == ["--port", "41000"]
+
+
+@pytest.mark.parametrize('equal', [False, True])
+@pytest.mark.parametrize(
+    'value',
+    [
+        'test key with spaces',
+        "test's key",
+        ' leading and trailing ',
+        '{"key":"test\'s key"}',
+        'text --intra-node-data-parallel-size=4 --port=9999',
+    ],
+)
+def test_static_router_parameters_preserve_values_until_launch(equal, value):
+    import shlex
+    from types import SimpleNamespace
+    from gpustack.schemas.models import PDModeEnum, RoleSpec
+    from gpustack.worker.backends.custom import CustomServer
+    from gpustack.worker.pd_router import apply_managed_router
+
+    option = (
+        f'--api-key={shlex.quote(value)}'
+        if equal
+        else f'--api-key {shlex.quote(value)}'
+    )
+    parameters = ['--intra-node-data-parallel-size=2', option]
+    model = _pd_model(RoleSpec(name='router', backend_parameters=parameters))
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    rendered = apply_managed_router(
+        model,
+        'router',
+        peers=PEERS,
+        variables={**VARIABLES, 'intra_node_data_parallel_size': 2},
+    )
+    server = CustomServer.__new__(CustomServer)
+    server._model = rendered
+    server._model_path = '/models/router'
+    server._model_instance = SimpleNamespace()
+    server._worker = SimpleNamespace(ip='127.0.0.1')
+    server._get_selected_gpu_devices = lambda: []
+    server._pd_injection_resolved, server._pd_injection_cache = True, None
+    server.inference_backend = None
+    argv = server._flatten_backend_param()
+    expected = [f'--api-key={value}'] if equal else ['--api-key', value]
+    assert argv == expected
+    assert model.roles[-1].backend_parameters == parameters
+
+
+def test_static_hybrid_hand_written_router_owns_its_local_dp():
+    from gpustack.schemas.models import PDModeEnum, RoleSpec
+    from gpustack.worker.pd_router import static_hybrid_router_variables
+
+    model = _pd_model(RoleSpec(name="router", run_command="my-router --local-dp 7"))
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    assert (
+        static_hybrid_router_variables(
+            model,
+            [
+                _static_hybrid_member("prefill", 1),
+                _static_hybrid_member("decode", 2, (1,)),
+            ],
+            "g",
+        )
+        == {}
+    )
+
+
+def test_static_hybrid_router_counts_external_rank_api_as_one_engine():
+    from gpustack.schemas.models import DistributedServers, PDModeEnum
+    from gpustack.worker.pd_router import static_hybrid_router_variables
+    from tests.utils.model import new_model_instance_workload
+
+    model = _pd_model()
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    decode = _static_hybrid_member("decode", 2, (1,))
+    decode.gpu_indexes = [0]
+    decode.distributed_servers = DistributedServers(
+        workloads=[
+            new_model_instance_workload(
+                state="running",
+                dp_rank_placements=[
+                    {
+                        "dp_rank": 0,
+                        "node_rank": 0,
+                        "gpu_indexes": [0],
+                        "api_port": decode.port,
+                        "ready": True,
+                    }
+                ],
+            ),
+        ]
+    )
+    assert static_hybrid_router_variables(
+        model,
+        [
+            _static_hybrid_member("prefill", 1, (1,)),
+            decode,
+        ],
+        "g",
+    ) == {"intra_node_data_parallel_size": 1}
+
+
+@pytest.mark.parametrize('no_servers', [False, True])
+def test_static_hybrid_router_infers_internal_scope_from_existing_topology(no_servers):
+    from gpustack.schemas.models import PDModeEnum
+    from gpustack.worker.pd_router import static_hybrid_router_variables
+
+    model = _pd_model()
+    model.disaggregation.mode = PDModeEnum.VLLM_MOONCAKE
+    model.roles[1].backend_parameters = ["--tp", "1"]
+    decode = _static_hybrid_member("decode", 2)
+    decode.distributed_servers.workloads = None
+    decode.distributed_servers.orchestration_mode = "legacy"
+    if no_servers:
+        decode.distributed_servers = None
+        decode.gpu_indexes = [0, 1, 2, 3]
+    with pytest.raises(ValueError, match="same local DP"):
+        static_hybrid_router_variables(
+            model, [_static_hybrid_member("prefill", 1), decode], "g"
+        )
+
+
+@pytest.mark.parametrize(
+    'parameters',
+    [
+        ['--intra-node-data-parallel-size'],
+        ['--intra-node-data-parallel-size', '--prefill', 'http://peer'],
+        ['--intra-node-data-parallel-size='],
+        ['--intra-node-data-parallel-size', 'bad'],
+    ],
+)
+def test_static_router_reports_a_malformed_local_dp_value(parameters):
+    from gpustack.worker.pd_router import _static_hybrid_router_parameters
+
+    with pytest.raises(ValueError, match='requires an integer value'):
+        _static_hybrid_router_parameters(parameters, 2)

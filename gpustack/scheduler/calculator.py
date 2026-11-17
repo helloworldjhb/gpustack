@@ -26,6 +26,7 @@ from gpustack.schemas.models import (
 )
 from gpustack.schemas.workers import Worker
 from gpustack.utils.compat_importlib import pkg_resources
+from gpustack.utils.command import flatten_to_argv, rewrite_value_bool_flags
 from gpustack.utils.convert import parse_duration, safe_int
 from gpustack.utils.hub import (
     filter_filename,
@@ -34,8 +35,9 @@ from gpustack.utils.hub import (
     match_model_scope_file_paths,
     get_pretrained_config,
     read_repo_file_content,
-    safe_pretrained_config_from_dict,
+    sum_weight_file_sizes,
 )
+from gpustack.utils.model_config import safe_pretrained_config_from_dict
 from gpustack.utils import platform
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,7 @@ class Estimate:
     imageOnly: bool = False
     distributable: bool = False
     reranking: bool = False
+    decision: bool = False
     contextSize: Optional[int] = None
 
 
@@ -212,6 +215,16 @@ class NoExitArgumentParser(argparse.ArgumentParser):
             raise argparse.ArgumentError(None, message or "Unknown error")
         # Ignore exit with status 0 (e.g., --help, --version)
         return
+
+
+# llama.cpp takes a value for these boolean flags, e.g. "--flash-attn on|off|auto".
+# Every spelling maps to the spelling that turns the flag off.
+VALUE_TAKING_BOOL_FLAGS = {
+    "--flash-attention": "--no-flash-attention",
+    "--flash-attn": "--no-flash-attn",
+    "--diffusion-fa": "--no-diffusion-fa",
+    "-fa": "--no-flash-attn",
+}
 
 
 @dataclass
@@ -504,7 +517,18 @@ class GGUFParserCommandMutableParameters:
         slogger = logger.getChild("gguf_parser_command")
 
         try:
-            args_parsed = parser.parse_known_args(args=args)
+            # The backend parameters are an argv, but each entry may hold more
+            # than one token, e.g. "--flash-attn on". Flatten them first, then
+            # fold the value of the flags that llama.cpp spells with a value
+            # into the flag spelling, so that the parser reads what the user
+            # asked for.
+            argv, unrecognized = rewrite_value_bool_flags(
+                flatten_to_argv(args), VALUE_TAKING_BOOL_FLAGS
+            )
+            for value in unrecognized:
+                slogger.warning(f"Ignored an unsupported boolean flag value: {value}")
+
+            args_parsed = parser.parse_known_args(args=argv)
             for attr_name in [attr.name for attr in dataclasses.fields(self.__class__)]:
                 try:
                     attr_value = getattr(args_parsed[0], attr_name, None)
@@ -521,6 +545,11 @@ class GGUFParserCommandMutableParameters:
                     pass
         except Exception as e:
             slogger.warning(f"Failed to parse mutable parameters: {e}")
+
+        # gguf-parser rejects -1 (llama.cpp "auto"), which needs the host
+        # devices to resolve, so the draft model keeps the default estimate.
+        if self.gpu_layers_draft == -1:
+            self.gpu_layers_draft = None
 
     def extend_command(self, command: List[str]):
         internal_properties = [
@@ -572,7 +601,7 @@ async def _gguf_parser_command(
         command.extend(["--cache-path", cache_dir])
 
     if offload == GPUOffloadEnum.Full:
-        command.extend(["--gpu-layers", "-1"])
+        command.extend(["--gpu-layers", "-2"])
     elif offload == GPUOffloadEnum.Partial:
         command.extend(["--gpu-layers-step", "1"])
     elif offload == GPUOffloadEnum.Disable:
@@ -695,12 +724,12 @@ async def get_pretrained_config_with_workers(
 
     Handles all model sources with appropriate fallback strategies:
     - For LOCAL_PATH model which is not available locally, get from workers
-    - For others, AutoConfig and fallback to config.json
+    - For others, read JSON metadata using installed configuration classes
 
     Args:
         model: Model to get config for
         workers: Available workers (for LOCAL_PATH)
-        trust_remote_code: Whether to trust remote code
+        trust_remote_code: Legacy option, ignored. Metadata never executes repository code.
 
     Returns:
         PretrainedConfig object or None
@@ -725,9 +754,7 @@ async def get_pretrained_config_with_workers(
         else:
             logger.info(f"Trying to get pretrained config from {model.source}")
             pretrained_config = await asyncio.wait_for(
-                asyncio.to_thread(
-                    get_pretrained_config, model, trust_remote_code=trust_remote_code
-                ),
+                asyncio.to_thread(get_pretrained_config, model),
                 timeout=timeout_in_seconds,
             )
     except Exception as e:
@@ -787,20 +814,8 @@ def should_fallback_load_config_json(e: Exception, model: Model) -> bool:
         # Track upstream progress: https://github.com/huggingface/transformers/issues/43837
         return True
 
-    # For very new HF checkpoints, AutoConfig may fail on an older transformers.
-    # Falling back to reading config.json avoids requiring a transformers upgrade.
-    #
-    # Example upstream error message (may vary by transformers version):
-    """
-    The checkpoint you are trying to load has model type `{config_dict['model_type']}`
-    but Transformers does not recognize this architecture. This could be because of an
-    issue with the checkpoint, or because your version of Transformers is out of date.
-    You can update Transformers with the command `pip install --upgrade transformers`.
-    If this does not work, and the checkpoint is very new, then there may not be a
-    release version that supports this model yet. In this case, you can get the most
-    up-to-date code by installing Transformers from source with the command
-    `pip install git+https://github.com/huggingface/transformers.git`
-    """
+    # Retry direct JSON retrieval when configuration loading surfaces a
+    # Transformers architecture/version diagnostic.
     msg = str(e).lower()
     if (
         "update transformers" in msg
@@ -1327,19 +1342,14 @@ def calculate_llm_model_weight_size(path: str) -> int:
     if not os.path.isdir(path):
         raise NotADirectoryError(f"The specified path '{path}' is not a directory.")
 
-    weight_file_extensions = (".safetensors", ".bin", ".pt", ".pth")
-    total_size = 0
-
     try:
         with os.scandir(path) as it:
-            for entry in it:
-                if entry.is_file() and entry.name.endswith(weight_file_extensions):
-                    total_size += entry.stat().st_size
+            return sum_weight_file_sizes(
+                (entry.name, entry.stat().st_size) for entry in it if entry.is_file()
+            )
     except PermissionError:
         logger.error(f"Permission denied when accessing '{path}'.")
         raise
-
-    return total_size
 
 
 def calculate_diffusion_model_weight_size(path: str) -> int:

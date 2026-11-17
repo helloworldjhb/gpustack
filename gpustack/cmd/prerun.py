@@ -15,7 +15,11 @@ from gpustack.cmd.start import (
 )
 from gpustack.utils.envs import get_gpustack_env
 from gpustack.utils.ephemeral_ports import ensure_reserved_against_ephemeral
-from gpustack.utils.network import is_port_available, parse_port_range
+from gpustack.utils.network import (
+    is_port_available,
+    is_port_reusable,
+    parse_port_range,
+)
 from gpustack.utils.s6_services import (
     gateway_services,
     postgres_services,
@@ -125,11 +129,20 @@ def check_ports_availability(cfg: Config, *services: str):
     }
     should_fail = False
     for port, service in ports_to_check.items():
-        if not is_port_available(port):
-            logger.error(
-                f"Port {port} required for service '{service}' is not available."
+        if is_port_available(port):
+            continue
+        if is_port_reusable(port):
+            # Only residual TCP state (e.g. TIME_WAIT from a process that
+            # just exited) holds the port. The s6 services bind with
+            # SO_REUSEADDR, the same way this probe just did, so the port
+            # is effectively available for them.
+            logger.info(
+                f"Port {port} required for service '{service}' is held only by "
+                "residual TCP state and will be rebound."
             )
-            should_fail = True
+            continue
+        logger.error(f"Port {port} required for service '{service}' is not available.")
+        should_fail = True
     if should_fail:
         raise Exception("One or more required ports are not available.")
 
@@ -289,6 +302,11 @@ scrape_configs:
   - job_name: gpustack-proxy-worker-discovery
     scrape_interval: 5s
     proxy_url: "http://127.0.0.1:{cfg.get_proxy_port()}"
+    # The forward proxy authenticates every request, so scrapes routed
+    # through it present the derived gateway token. Prometheus sends this
+    # as the Authorization header on the proxied absolute-URI request.
+    authorization:
+      credentials: "{cfg.get_derived_gateway_token()}"
     http_sd_configs:
       - url: "http://127.0.0.1:{cfg.metrics_port}/metrics/proxy-targets"
         refresh_interval: 1m
@@ -350,6 +368,16 @@ scrape_configs:
 """
 
     prometheus_config_path.write_text(prometheus_config)
+    # The config carries the gateway token, so keep it to the services that
+    # read it. A read-only or exotic mount can refuse chmod even on a file
+    # this process just wrote; failing to tighten the mode must not take
+    # the whole server down with it.
+    try:
+        os.chmod(prometheus_config_path, 0o600)
+    except OSError as e:
+        logger.warning(
+            f"Failed to restrict permissions on {prometheus_config_path}: {e}"
+        )
 
     grafana_provisioning_dir = Path(
         os.getenv("GF_PATHS_PROVISIONING", "/etc/grafana/provisioning")

@@ -1,17 +1,19 @@
 import threading
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gpustack.schemas.cache_services import CacheServiceInstance
 from gpustack.worker.cache_service_logs import CacheServiceLogManager
 
 
 def instance():
-    return SimpleNamespace(
+    return CacheServiceInstance(
         id=11,
         name="cache-test",
-        get_deployment_metadata=lambda: SimpleNamespace(name="cache-svc-5-i11"),
+        cache_service_id=5,
+        worker_id=1,
+        cluster_id=1,
     )
 
 
@@ -54,6 +56,7 @@ def test_reattaching_writer_resumes_and_is_not_duplicated(tmp_path):
     entered = threading.Event()
 
     def persist(_name, _path, stop, resume):
+        assert _name == instance().name
         assert resume
         entered.set()
         stop.wait(2)
@@ -80,6 +83,7 @@ def test_archive_drains_exit_output_and_resumes_without_duplicates(
     ]
 
     def runtime_logs(**kwargs):
+        assert kwargs["name"] == instance().name
         assert kwargs["follow"] is False
         if output_type == "stream":
             return iter(lines)
@@ -87,7 +91,7 @@ def test_archive_drains_exit_output_and_resumes_without_duplicates(
         return output if output_type == "bytes" else output.decode()
 
     with patch(
-        "gpustack.worker.container_logs.logs_workload", side_effect=runtime_logs
+        "gpustack.worker.container_logs._read_runtime_logs", side_effect=runtime_logs
     ):
         assert manager.archive(instance(), path)
         assert manager.archive(instance(), path)
@@ -101,7 +105,7 @@ def test_failed_archive_keeps_retry_possible(tmp_path):
     manager = CacheServiceLogManager(str(tmp_path))
     path = manager.prepare(instance())
     with patch(
-        "gpustack.worker.container_logs.logs_workload",
+        "gpustack.worker.container_logs._read_runtime_logs",
         side_effect=RuntimeError("runtime unavailable"),
     ):
         assert not manager.archive(instance(), path)

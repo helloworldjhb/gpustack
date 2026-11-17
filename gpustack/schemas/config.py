@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from gpustack import __benchmark_runner_version__
 
@@ -69,6 +69,7 @@ class PredefinedConfig(SensitivePredefinedConfig):
     bin_dir: Optional[str] = None
     benchmark_dir: Optional[str] = None
     system_default_container_registry: Optional[str] = None
+    container_namespace: Optional[str] = None
     image_name_override: Optional[str] = None
     image_repo: str = "gpustack/gpustack"
     benchmark_image_repo: str = (
@@ -129,6 +130,13 @@ class PredefinedConfigNoDefaults(PredefinedConfig):
     benchmark_image_repo: Optional[str] = None
     gateway_mode: Optional[str] = None
     gateway_namespace: Optional[str] = None
+
+
+class PredefinedConfigPublic(PredefinedConfigNoDefaults):
+    """Worker settings with credentials masked in public responses."""
+
+    model_config = ConfigDict(from_attributes=True)
+    huggingface_token: Optional[SecretStr] = None
 
 
 def parse_base_model_to_env_vars(

@@ -33,7 +33,7 @@ from gpustack.schemas.workers import Worker
 from gpustack.utils.command import find_parameter
 from gpustack.utils.convert import safe_int
 from gpustack.utils.gpu import parse_gpu_id, group_gpu_ids_by_worker
-from gpustack.utils.unit import byte_to_gib, byte_to_kib
+from gpustack.utils.unit import byte_to_gib
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,7 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         """Initialize model parameters."""
         self._param_tensor_split = None
         self._param_gpu_layers = None
-        self._param_ctx_size_in_kib = 8192
+        self._param_ctx_size = None
         if model.backend_parameters:
             self._param_tensor_split = find_parameter(
                 model.backend_parameters, ["ts", "tensor-split"]
@@ -157,13 +157,19 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
                 model.backend_parameters, ["ngl", "gpu-layers", "n-gpu-layers"]
             )
             if _param_gpu_layers:
-                self._param_gpu_layers = safe_int(_param_gpu_layers, default=None)
+                gpu_layers = safe_int(_param_gpu_layers, default=None)
+                # llama.cpp reads -1 as "auto", which leaves the layer count to
+                # the estimate, and -2 as "all", which _set_model_parameters
+                # resolves to the model's layer count.
+                if gpu_layers is not None and (gpu_layers >= 0 or gpu_layers == -2):
+                    self._param_gpu_layers = gpu_layers
 
             _param_ctx_size = find_parameter(
                 self._model.backend_parameters, ["ctx-size", "c"]
             )
             if _param_ctx_size:
-                self._param_ctx_size_in_kib = byte_to_kib(safe_int(_param_ctx_size))
+                # The context size is a number of tokens, not a number of bytes.
+                self._param_ctx_size = safe_int(_param_ctx_size, default=None)
 
     def _initialize_selected_gpu_ids(self):
         """Initialize selected GPU IDs."""
@@ -330,8 +336,30 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
 
         self._set_single_layer_vram(result, rpc_result)
 
+    def _estimate_context_size_note(self) -> Optional[str]:
+        """
+        Describe the context size the resource estimate was based on.
+
+        Returns None for the models that have no context, e.g. the diffusion models.
+        """
+        if not self._full_offload_resource_claim:
+            return None
+        context_size = self._full_offload_resource_claim.contextSize
+        if not context_size:
+            return None
+        note = f"The estimate is based on a context size of {context_size} tokens."
+        requested = self._param_ctx_size
+        # The estimator rounds the context size up to a multiple of 32, or of 256
+        # with Flash Attention, so a difference below that is the rounding and not
+        # another context size.
+        if requested and abs(context_size - requested) > 256:
+            note += f" The model requests a context size of {requested} tokens."
+        return note
+
     def _set_model_parameters(self):
-        if self._param_gpu_layers and self._param_gpu_layers > self._total_layers:
+        if self._param_gpu_layers == -2 or (
+            self._param_gpu_layers and self._param_gpu_layers > self._total_layers
+        ):
             self._param_gpu_layers = self._total_layers
 
     def _set_messages(self, candidates: List[ModelInstanceScheduleCandidate]):
@@ -441,6 +469,9 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             msg = ListMessageBuilder(
                 f"The model requires approximately {byte_to_gib(self._non_uma_single_gpu_full_offload_vram)} GiB VRAM and {byte_to_gib(self._non_uma_single_gpu_full_offload_ram)} GiB RAM."
             )
+            context_size_note = self._estimate_context_size_note()
+            if context_size_note:
+                msg.append(context_size_note)
             if self._selected_gpu_ids:
                 msg.append(
                     "Selected GPUs do not meet the requirements to run the model."
@@ -2319,17 +2350,19 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
             return
 
         ram = self._workers_allocatable_resource.get(gpu_vram[0]).ram
+        messages = [
+            f"The model requires approximately {byte_to_gib(self._non_uma_single_gpu_full_offload_vram)} GiB VRAM and {byte_to_gib(self._non_uma_single_gpu_full_offload_ram)} GiB RAM.",
+        ]
+        context_size_note = self._estimate_context_size_note()
+        if context_size_note:
+            messages.append(context_size_note)
+        messages.append(
+            f"The available GPU has {byte_to_gib(gpu_vram[2])} GiB VRAM and {byte_to_gib(ram)} GiB RAM.",
+        )
         self._event_collector.add(
             EventLevelEnum.INFO,
             EVENT_ACTION_SINGLE_WORKER_SINGLE_GPU_FULL_OFFLOADING,
-            str(
-                ListMessageBuilder(
-                    [
-                        f"The model requires approximately {byte_to_gib(self._non_uma_single_gpu_full_offload_vram)} GiB VRAM and {byte_to_gib(self._non_uma_single_gpu_full_offload_ram)} GiB RAM.",
-                        f"The available GPU has {byte_to_gib(gpu_vram[2])} GiB VRAM and {byte_to_gib(ram)} GiB RAM.",
-                    ]
-                )
-            ),
+            str(ListMessageBuilder(messages)),
             reason=EVENT_REASON_INSUFFICIENT_RESOURCES,
         )
 

@@ -1,10 +1,8 @@
 import asyncio
 import json
 from concurrent.futures import ProcessPoolExecutor
-from functools import partial
 import glob
 import hashlib
-from itertools import chain
 import logging
 from pathlib import Path
 import platform
@@ -14,8 +12,10 @@ from typing import Dict, Optional, Tuple
 
 from filelock import Timeout
 import modelscope
+import setproctitle
 from modelscope.hub.constants import TEMPORARY_FOLDER_NAME, API_FILE_DOWNLOAD_CHUNK_SIZE
-from multiprocessing import Manager, cpu_count
+from multiprocessing import cpu_count, get_context
+from multiprocessing.managers import SyncManager
 from packaging.version import Version
 from huggingface_hub._local_folder import get_local_download_paths
 from huggingface_hub.file_download import get_hf_file_metadata, hf_hub_url
@@ -87,9 +87,20 @@ class ModelFileManager:
                 await asyncio.sleep(5)
 
     def _prerun(self):
-        self._mp_manager = Manager()
+        # Download-related children (the shared manager and the pool workers)
+        # must not inherit the parent's pooled sockets: a forked child keeps
+        # half-closed fds alive even after the parent closes its own copies.
+        spawn = get_context("spawn")
+        self._mp_manager = SyncManager(ctx=spawn)
+        self._mp_manager.start(
+            initializer=setproctitle.setproctitle,
+            initargs=('gpustack_model_file_manager',),
+        )
         self._download_pool = ProcessPoolExecutor(
             max_workers=min(max_concurrent_downloads, cpu_count()),
+            mp_context=spawn,
+            initializer=setproctitle.setproctitle,
+            initargs=('gpustack_model_file_download',),
         )
 
     def _handle_model_file_event(self, event: Event):
@@ -235,16 +246,21 @@ class ModelFileManager:
     async def _delete_model_file(self, model_file: ModelFile):
         try:
             if model_file.resolved_paths:
-                paths = chain.from_iterable(
-                    glob.glob(p) if '*' in p else [p] for p in model_file.resolved_paths
-                )
-                for path in paths:
-                    delete_path(path)
+                for resolved_path in model_file.resolved_paths:
+                    paths = (
+                        await asyncio.to_thread(glob.glob, resolved_path)
+                        if '*' in resolved_path
+                        else [resolved_path]
+                    )
+                    for path in paths:
+                        await asyncio.to_thread(delete_path, path)
 
             await self._delete_incomplete_model_files(model_file)
 
             # Clean up download log file when deleting model file
-            _cleanup_download_log(self._config.log_dir, model_file.id)
+            await asyncio.to_thread(
+                _cleanup_download_log, self._config.log_dir, model_file.id
+            )
 
             logger.info(
                 f"Deleted model file {model_file.readable_source}(id: {model_file.id}) from disk"
@@ -315,6 +331,7 @@ class ModelFileDownloadTask:
         # Dict[tqdm_id, {'last_update_time': float, 'last_progress': float}]
         self._file_progress_tracking = {}
         self._tqdm_file_basename = {}
+        self._huggingface_file_progress = {}
         self._modelscope_manifest = {}
         self._modelscope_selected_files = None
         self._modelscope_invalid_final_stats = {}
@@ -332,14 +349,20 @@ class ModelFileDownloadTask:
 
     def prerun(self):
         setup_logging(self._config.debug)
-        self._clientset = ClientSet(
+        client_options = dict(
             base_url=self._config.get_server_url(),
             api_key=read_worker_token(self._config.data_dir),
         )
+        self._clientset = ClientSet(**client_options)
+        if self._model_file.source == SourceEnum.HUGGING_FACE:
+            # Progress is best-effort. Bound its requests so cancellation can
+            # join callbacks and reporters without waiting for the API default.
+            self._progress_clientset = ClientSet(**client_options, timeout=2.0)
         self._download_start_time = time.time()
         self._ensure_model_file_size_and_paths()
 
         self._speed_lock = threading.Lock()
+        self._huggingface_progress_event = threading.Event()
         # Create thread locks in the child process so download tasks stay picklable.
         self._progress_lock = threading.Lock()
         self._last_reported_progress = -1.0
@@ -351,9 +374,6 @@ class ModelFileDownloadTask:
         self._setup_instance_log_files()
 
         logger.debug(f"Initializing task for {self._model_file.readable_source}")
-        self._update_progress_func = partial(
-            self._update_model_file_progress, self._model_file.id
-        )
         self._model_file_size = self._model_file.size
         self.hijack_tqdm_progress()
 
@@ -493,46 +513,70 @@ class ModelFileDownloadTask:
 
     def run(self):
         try:
-            self.prerun()
-            self._write_to_instance_download_logs(
-                f"Model file download task started: {self._model_file.readable_source}"
-            )
-            self._download_model_file()
-            self._write_to_instance_download_logs(
-                f"Model file download task completed successfully: {self._model_file.readable_source}"
-            )
-        except asyncio.CancelledError:
-            self._write_to_instance_download_logs(
-                f"Download task cancelled: {self._model_file.readable_source}"
-            )
-        except Timeout:
-            lock_path = get_lock_path(self._config.cache_dir, self._model_file)
-
-            info = read_lock_info(lock_path) if lock_path else None
-            owner_id = info.get("worker_id") if info else None
-            current_worker_id = self._model_file.worker_id
-
-            if owner_id is None or owner_id != current_worker_id:
-                logger.warning(
-                    f"Download model {self._model_file.readable_source} timed out: "
-                    f"lock held by other worker, please try again later."
+            try:
+                self.prerun()
+                self._write_to_instance_download_logs(
+                    f"Model file download task started: {self._model_file.readable_source}"
                 )
-                return
+                self._download_model_file()
+                self._write_to_instance_download_logs(
+                    f"Model file download task completed successfully: {self._model_file.readable_source}"
+                )
+            except asyncio.CancelledError:
+                self._write_to_instance_download_logs(
+                    f"Download task cancelled: {self._model_file.readable_source}"
+                )
+            except Timeout:
+                lock_path = get_lock_path(self._config.cache_dir, self._model_file)
 
-            logger.warning(
-                f"Download model {self._model_file.readable_source} timed out waiting to acquire the lock. "
-                f"There might be another download task currently downloading the same model to the same disk directory."
-            )
-        except Exception as e:
-            self._write_to_instance_download_logs(
-                f"Download task failed: {self._model_file.readable_source} - {str(e)}",
-                is_error=True,
-            )
-            self._update_model_file(
-                self._model_file.id,
-                state=ModelFileStateEnum.ERROR,
-                state_message=str(e),
-            )
+                info = read_lock_info(lock_path) if lock_path else None
+                owner_id = info.get("worker_id") if info else None
+                current_worker_id = self._model_file.worker_id
+
+                if owner_id is None or owner_id != current_worker_id:
+                    logger.warning(
+                        f"Download model {self._model_file.readable_source} timed out: "
+                        f"lock held by other worker, please try again later."
+                    )
+                    return
+
+                logger.warning(
+                    f"Download model {self._model_file.readable_source} timed out waiting to acquire the lock. "
+                    f"There might be another download task currently downloading the same model to the same disk directory."
+                )
+            except Exception as e:
+                self._write_to_instance_download_logs(
+                    f"Download task failed: {self._model_file.readable_source} - {str(e)}",
+                    is_error=True,
+                )
+                self._update_model_file(
+                    self._model_file.id,
+                    state=ModelFileStateEnum.ERROR,
+                    state_message=str(e),
+                )
+        finally:
+            self._close_clientsets()
+
+    def _close_clientsets(self):
+        """Release this task's ClientSets so their pooled connections close.
+
+        httpcore only evicts dead pooled connections once a later request
+        touches the pool, so an unclosed ClientSet strands its keep-alive
+        socket until the worker process exits.
+        """
+        for clientset in (
+            getattr(self, "_progress_clientset", None),
+            getattr(self, "_clientset", None),
+        ):
+            if clientset is None:
+                continue
+            try:
+                clientset.http_client.close()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to close clientset for "
+                    f"{self._model_file.readable_source}: {e}"
+                )
 
     def _read_lora_adapter_config(self, model_paths) -> Optional[dict]:
         """Return parsed adapter_config.json as a dict, or None when the file is absent.
@@ -553,27 +597,6 @@ class ModelFileDownloadTask:
         if not isinstance(data, dict):
             raise ValueError("adapter_config.json is not a JSON object")
         return data
-
-    def _validate_lora_base_model(self, cfg: dict) -> Optional[str]:
-        """Return error if the adapter's base model mismatches the expected base_model."""
-        base = cfg.get("base_model_name_or_path") or cfg.get("base_model_name")
-        expected = (getattr(self._model_file, "base_model", None) or "").strip()
-        if expected and base:
-            nb = str(base).strip().strip("/").lower()
-            ne = expected.strip("/").lower()
-            if nb == ne:
-                return None
-            # Fall back to basename when exactly one side is a local-path style
-            # (no "/"): a repo id "org/Qwen3-4B" should still match a local
-            # directory ".../Qwen3-4B". Two repo ids must match in full to
-            # avoid OrgA/Qwen3-4B silently mounting on OrgB/Qwen3-4B.
-            if ("/" in nb) != ("/" in ne):
-                if nb.rsplit("/", 1)[-1] == ne.rsplit("/", 1)[-1]:
-                    return None
-            return (
-                f"adapter_config base_model mismatch: {base!r} vs expected {expected!r}"
-            )
-        return None
 
     def _fail_lora_resolution(self, message: str) -> None:
         """Mark the model file ERROR for a LoRA problem and signal the caller to abort."""
@@ -611,17 +634,13 @@ class ModelFileDownloadTask:
             return {}
 
         if detected_lora:
-            # Detected by adapter_config.json: validate strictly, backfill base_model.
-            err = self._validate_lora_base_model(cfg)
-            if err:
-                return self._fail_lora_resolution(err)
             if not self._model_file.base_model:
                 self._model_file.base_model = cfg.get(
                     "base_model_name_or_path"
                 ) or cfg.get("base_model_name")
         else:
             # User override with no adapter_config.json at the probe path: trust the
-            # user (likely a detection false-negative), skip path-based validation.
+            # user hint when artifact detection cannot identify the adapter.
             logger.info(
                 f"is_lora forced by user input for {self._model_file.readable_source}; "
                 "adapter_config.json not detected at resolved path."
@@ -629,21 +648,35 @@ class ModelFileDownloadTask:
 
         return {"is_lora": True, "base_model": self._model_file.base_model}
 
+    def _check_cancelled(self):
+        if self._cancel_flag.is_set():
+            raise asyncio.CancelledError('Download cancelled')
+
     def _download_model_file(self):
+        self._check_cancelled()
         self._write_to_instance_download_logs(
             f"Downloading model file: {self._model_file.readable_source}"
         )
 
         is_modelscope = self._model_file.source == SourceEnum.MODEL_SCOPE
+        is_huggingface = self._model_file.source == SourceEnum.HUGGING_FACE
         stop_progress = threading.Event()
-        monitor = None
+        monitors = []
+        pollers = []
         if is_modelscope:
+            pollers.append(self._poll_modelscope_progress)
+        elif is_huggingface:
+            pollers.extend(
+                [self._poll_huggingface_progress, self._watch_huggingface_cancellation]
+            )
+        for poll_progress in pollers:
             monitor = threading.Thread(
-                target=self._poll_modelscope_progress,
+                target=poll_progress,
                 args=(stop_progress,),
                 daemon=True,
             )
             monitor.start()
+            monitors.append(monitor)
         try:
             model_paths = downloaders.download_model(
                 self._model_file,
@@ -651,12 +684,22 @@ class ModelFileDownloadTask:
                 cache_dir=self._config.cache_dir,
                 huggingface_token=self._config.huggingface_token,
                 model_scope_files=self._modelscope_selected_files,
+                huggingface_progress=self._report_huggingface_progress,
+                huggingface_cancel_check=self._check_cancelled,
             )
+        except (Exception, KeyboardInterrupt):
+            self._check_cancelled()
+            raise
         finally:
-            if monitor is not None:
-                stop_progress.set()
+            stop_progress.set()
+            if is_huggingface:
+                self._huggingface_progress_event.set()
+            for monitor in monitors:
                 monitor.join()
+            if is_huggingface:
+                self._progress_clientset.http_client.close()
 
+        self._check_cancelled()
         if is_modelscope:
             try:
                 self._report_modelscope_progress()
@@ -702,7 +745,7 @@ class ModelFileDownloadTask:
             task_self._handle_tqdm_init(self, _original_init, *args, **kwargs)
 
         def _new_update(self: tqdm, n=1):
-            task_self._handle_tqdm_update(self, _original_update, n)
+            return task_self._handle_tqdm_update(self, _original_update, n)
 
         tqdm.__init__ = _new_init
         tqdm.update = _new_update
@@ -717,6 +760,13 @@ class ModelFileDownloadTask:
         if getattr(tqdm_instance, 'unit', None) != 'B':
             return
 
+        # Xet network bytes and reconstructed file bytes describe the same file.
+        # Only count the file progress bars supplied by HfDownloader.
+        if self._model_file.source == SourceEnum.HUGGING_FACE and not getattr(
+            tqdm_instance, '_gpustack_track_download', False
+        ):
+            return
+
         # Assign unique ID, line number, and progress tracking under a lock so
         # concurrent thread_map workers don't collide on _tqdm_counter.
         with self._speed_lock:
@@ -728,12 +778,6 @@ class ModelFileDownloadTask:
                 'last_update_time': 0,
                 'last_progress': 0.0,
             }
-            if (
-                hasattr(self, '_model_file_size')
-                and self._model_file.source != SourceEnum.MODEL_SCOPE
-            ):
-                # Resume: tqdm initial n is the already-downloaded byte count.
-                self._model_downloaded_size += tqdm_instance.n
         tqdm_instance._gpustack_id = tqdm_id
 
         # Write initial progress line for this file using ANSI cursor positioning
@@ -746,59 +790,30 @@ class ModelFileDownloadTask:
     def _handle_tqdm_update(self, tqdm_instance, original_update, n=1):
         # Get the tqdm ID and line number for this instance
         tqdm_id = getattr(tqdm_instance, '_gpustack_id', None)
-        if tqdm_id is None or tqdm_id not in self._file_line_mapping:
-            return
-        if getattr(tqdm_instance, 'unit', None) != 'B':
-            return
-        if self._resume_threshold and n > self._resume_threshold:
+        is_tracked = (
+            tqdm_id in self._file_line_mapping
+            and getattr(tqdm_instance, 'unit', None) == 'B'
+        )
+        if is_tracked and self._resume_threshold and n > self._resume_threshold:
             # https://github.com/modelscope/modelscope/blob/609442d271bd7ed106a0933b1937289be7c1ad01/modelscope/hub/file_download.py#L417-L422
             # During download reconnection events, the progress bar may recalculate based on the current downloaded size.
             # We need to intercept this behavior and read the actual cached file size to correct the progress display.
             n = self._adjust_downloaded_by_cache_size(tqdm_instance, n)
-        original_update(tqdm_instance, n)
+        result = original_update(tqdm_instance, n)
 
         if self._cancel_flag.is_set():
+            if getattr(tqdm_instance, '_gpustack_xet_download', False):
+                # Xet prints callback exceptions and continues its native work.
+                # The monitor cancels the native session outside the callback.
+                return result
             raise asyncio.CancelledError("Download cancelled")
+
+        if not is_tracked:
+            return result
 
         line_number = self._file_line_mapping[tqdm_id]
 
-        is_modelscope = self._model_file.source == SourceEnum.MODEL_SCOPE
-        reached_full = False
-        if not is_modelscope:
-            with self._speed_lock:
-                self._model_downloaded_size += n
-                # Bytes done but download_model not yet returned (finalize phase).
-                reached_full = (
-                    not self._finalizing_logged
-                    and self._model_file_size is not None
-                    and self._model_file_size > 0
-                    and self._model_downloaded_size >= self._model_file_size
-                )
-                if reached_full:
-                    self._finalizing_logged = True
-
-        if reached_full:
-            self._write_finalize_note(
-                "All files downloaded. Finalizing (assembling/verifying)... "
-                "progress holds at 99% until finalization completes."
-            )
-
         try:
-            # Cap at 99% until download_model returns; READY sets the real 100%.
-            progress = None
-            if not is_modelscope:
-                progress = min(
-                    (
-                        round(
-                            (self._model_downloaded_size / self._model_file_size) * 100,
-                            2,
-                        )
-                        if self._model_file_size
-                        else 0.0
-                    ),
-                    99.0,
-                )
-
             # Update individual file progress using ANSI cursor positioning
             current_time = time.time()
 
@@ -826,10 +841,6 @@ class ModelFileDownloadTask:
             )
 
             if should_log:
-                # Update progress to server
-                if progress is not None:
-                    self._update_progress_func(progress)
-
                 # Format progress message using tqdm's string representation
                 progress_str = str(tqdm_instance)
                 self._write_progress_with_cursor_positioning(
@@ -999,11 +1010,86 @@ class ModelFileDownloadTask:
         ansi_message = f"\033[{line_num};1H\033[2K[{timestamp}] {message}\n"
         self._write_to_instance_download_logs(ansi_message, use_tqdm_format=True)
 
+    def _report_huggingface_progress(self, filename: str, downloaded: int):
+        """Record valid file bytes without blocking SDK callbacks on the API."""
+        if self._cancel_flag.is_set():
+            return
+        with self._speed_lock:
+            self._huggingface_file_progress[filename] = max(0, downloaded)
+            self._model_downloaded_size = sum(self._huggingface_file_progress.values())
+        self._huggingface_progress_event.set()
+
+    def _flush_huggingface_progress(self, force: bool = False):
+        """Send the latest snapshot from the single progress reporting thread."""
+        if self._cancel_flag.is_set():
+            return
+        try:
+            # Only copy counters under the lock shared with SDK callbacks and
+            # progress-bar initialization. HTTP requests must not hold it.
+            with self._speed_lock:
+                if not self._huggingface_file_progress or not self._model_file_size:
+                    return
+                downloaded = self._model_downloaded_size
+            current_time = time.time()
+            progress = min(round(downloaded / self._model_file_size * 100, 2), 99.0)
+            decreased = progress < self._last_reported_progress
+            reached_full = downloaded >= self._model_file_size
+            if (
+                not force
+                and not decreased
+                and not reached_full
+                and current_time - self._last_download_update_time
+                < self._log_update_interval
+            ):
+                return
+            self._update_model_file_progress(
+                self._model_file.id, progress, allow_decrease=True
+            )
+            self._last_download_update_time = current_time
+            if reached_full and not self._finalizing_logged:
+                self._finalizing_logged = True
+                self._write_finalize_note(
+                    "All files downloaded. Finalizing (assembling/verifying)... "
+                    "progress holds at 99% until finalization completes."
+                )
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            if not self._cancel_flag.is_set():
+                logger.warning(
+                    f"Failed to report Hugging Face download progress: {e}",
+                    exc_info=True,
+                )
+
+    def _poll_huggingface_progress(self, stop: threading.Event):
+        # Wake on callbacks and periodically retry pending/throttled reports.
+        # Drain the final snapshot before READY or ERROR can be reported.
+        while not self._cancel_flag.is_set():
+            self._huggingface_progress_event.wait(1)
+            self._huggingface_progress_event.clear()
+            stopping = stop.is_set()
+            self._flush_huggingface_progress(force=stopping)
+            if stopping:
+                return
+
+    def _watch_huggingface_cancellation(self, stop: threading.Event):
+        # Never wait on progress locks or HTTP requests before aborting native IO.
+        while not stop.wait(1):
+            if self._cancel_flag.is_set():
+                from huggingface_hub.utils._xet import abort_xet_session
+
+                # A pool worker runs one model task at a time, so every native
+                # download in this process belongs to the cancelled model.
+                abort_xet_session()
+                return
+
     def _poll_modelscope_progress(self, stop: threading.Event):
         report_failed = False
-        while not stop.is_set():
+        while not stop.is_set() and not self._cancel_flag.is_set():
             try:
                 self._report_modelscope_progress()
+            except asyncio.CancelledError:
+                return
             except Exception as e:
                 if not report_failed:
                     logger.warning(
@@ -1199,14 +1285,30 @@ class ModelFileDownloadTask:
                 not allow_decrease and progress < self._last_reported_progress
             ):
                 return
-            self._update_model_file(model_file_id, download_progress=progress)
+            clientset = (
+                self._progress_clientset
+                if self._model_file.source == SourceEnum.HUGGING_FACE
+                else self._clientset
+            )
+            self._update_model_file(
+                model_file_id, clientset=clientset, download_progress=progress
+            )
             self._last_reported_progress = progress
 
-    def _update_model_file(self, id: int, **kwargs):
-        model_file_public = self._clientset.model_files.get(id=id)
+    def _update_model_file(
+        self, id: int, clientset: Optional[ClientSet] = None, **kwargs
+    ):
+        self._check_cancelled()
+        clientset = clientset or self._clientset
+        try:
+            model_file_public = clientset.model_files.get(id=id)
 
-        model_file_update = ModelFileUpdate(**model_file_public.model_dump())
-        for key, value in kwargs.items():
-            setattr(model_file_update, key, value)
+            model_file_update = ModelFileUpdate(**model_file_public.model_dump())
+            for key, value in kwargs.items():
+                setattr(model_file_update, key, value)
 
-        self._clientset.model_files.update(id=id, model_update=model_file_update)
+            self._check_cancelled()
+            clientset.model_files.update(id=id, model_update=model_file_update)
+        except NotFoundException:
+            self._cancel_flag.set()
+            raise asyncio.CancelledError(f'Model file {id} was deleted') from None

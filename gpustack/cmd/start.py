@@ -128,8 +128,14 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
     common_group.add_argument(
         "--system-default-container-registry",
         type=str,
-        help="Default container registry for GPUStack to pull system and inference images. The default is 'docker.io'. Keep all GPUStack business images under the 'gpustack' namespace; if a multi-level namespace is required, keep 'gpustack' as the last level (e.g. 'awesome.com/amazing-group/amazing-subgroup/gpustack') and set this to the parent path (e.g. 'awesome.com/amazing-group/amazing-subgroup'). If the images cannot stay under the 'gpustack' namespace (e.g. 'gpustack-ai'), adjust --image-repo and --benchmark-image-repo accordingly.",
+        help="Default container registry for GPUStack to pull system and inference images. The default is 'docker.io'. Keep all GPUStack business images under the 'gpustack' namespace; if a multi-level namespace is required, keep 'gpustack' as the last level (e.g. 'awesome.com/amazing-group/amazing-subgroup/gpustack') and set this to the parent path (e.g. 'awesome.com/amazing-group/amazing-subgroup'). If the images cannot stay under the 'gpustack' namespace, set the container_namespace config key to change it for GPUStack worker, runner and runtime images; use --image-repo and --benchmark-image-repo for repository-specific overrides.",
         default=get_gpustack_env("SYSTEM_DEFAULT_CONTAINER_REGISTRY"),
+    )
+    common_group.add_argument(
+        "--container-namespace",
+        type=str,
+        help="Default namespace for GPUStack worker, runner, runtime, benchmark and cache service images.",
+        default=get_gpustack_env("CONTAINER_NAMESPACE"),
     )
     common_group.add_argument(
         "--image-name-override",
@@ -166,6 +172,11 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         type=str,
         help="The namespace where the gateway component is deployed.",
         default=get_gpustack_env("GATEWAY_NAMESPACE"),
+    )
+    common_group.add_argument(
+        "--trusted-proxy-cidrs",
+        action="append",
+        help="CIDR networks of proxies deployed in front of the gateway (e.g. --trusted-proxy-cidrs 10.0.0.0/8). The client IP resolution walks X-Forwarded-For through these proxies; when unset, only the address the gateway itself observed is used, so client-supplied forwarding headers cannot spoof the source address. List a subnet only when the proxy in front appends X-Forwarded-For itself.",
     )
     common_group.add_argument(
         "--service-discovery-name",
@@ -788,7 +799,7 @@ def run(args: argparse.Namespace):
         setup_logging(cfg.debug)
         debug_env_info()
         set_third_party_env(cfg=cfg)
-        start_tracemalloc_if_debug(cfg)
+        start_tracemalloc_if_enabled()
         initialize_gateway(cfg)
         multiprocessing.set_start_method('spawn')
 
@@ -821,6 +832,8 @@ def run_server(cfg: Config):
 
 
 def run_worker(cfg: Config):
+    # Spawned workers initialize process-local tracing before allocating state.
+    start_tracemalloc_if_enabled()
     set_global_config(cfg)
     worker = Worker(cfg)
     worker.start()
@@ -868,6 +881,7 @@ def set_common_options(args, config_data: dict):
         "huggingface_token",
         "insecure_tls",
         "system_default_container_registry",
+        "container_namespace",
         "image_name_override",
         "image_repo",
         "benchmark_image_repo",
@@ -879,6 +893,7 @@ def set_common_options(args, config_data: dict):
         "gateway_mode",
         "gateway_kubeconfig",
         "gateway_namespace",
+        "trusted_proxy_cidrs",
         "service_discovery_name",
         "namespace",
     ]
@@ -992,12 +1007,13 @@ def debug_env_info():
         logger.debug(f"Using HF_ENDPOINT: {hf_endpoint}")
 
 
-def start_tracemalloc_if_debug(cfg: Config):
-    if cfg.debug:
+def start_tracemalloc_if_enabled() -> None:
+    if envs.DEBUG_ENABLE_TRACEMALLOC:
         import tracemalloc
 
-        tracemalloc.start()
-        logger.debug("tracemalloc started for memory profiling")
+        if not tracemalloc.is_tracing():
+            tracemalloc.start()
+            logger.info("tracemalloc started for memory profiling")
 
 
 def set_third_party_env(cfg: Config):

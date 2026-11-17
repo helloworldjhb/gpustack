@@ -33,10 +33,16 @@ from gpustack.routes.plugins.decision_service.providers import (
     DECISION_PROVIDER_TYPES,
     is_decision_config,
 )
+from gpustack.routes.plugins.decision_service.plugin import (
+    decision_referencing_route_ids,
+)
+from gpustack.routes.plugins.capability_policy import CapabilityPolicy
 from gpustack.schemas.models import CategoryEnum
-from gpustack.schemas.model_routes import ModelRouteTarget
+from gpustack.schemas.model_routes import ModelRoute, ModelRouteTarget
+from gpustack.api.streaming import tenant_streaming
 from gpustack.api.exceptions import (
     AlreadyExistsException,
+    BadRequestException,
     InternalServerErrorException,
     NotFoundException,
     InvalidException,
@@ -163,7 +169,12 @@ async def get_model_providers(
 
     if params.watch:
         return StreamingResponse(
-            ModelProvider.streaming(fields=fields, fuzzy_fields=fuzzy_fields),
+            tenant_streaming(
+                ModelProvider,
+                ctx,
+                fields=fields,
+                fuzzy_fields=fuzzy_fields,
+            ),
             media_type="text/event-stream",
         )
 
@@ -272,10 +283,15 @@ async def create_model_provider(
             session=session,
             id=input.clone_from_id,
         )
-        if not clone_from:
+        if not clone_from or clone_from.deleted_at is not None:
             raise NotFoundException(
                 message=f"provider {input.clone_from_id} to clone from not found"
             )
+        assert_resource_visible(
+            ctx,
+            clone_from,
+            not_found_message=f"provider {input.clone_from_id} to clone from not found",
+        )
         existing_tokens = clone_from.api_tokens or []
     input_dict["api_tokens"] = parse_api_tokens(
         existing_tokens=existing_tokens, api_tokens=input.api_tokens
@@ -404,6 +420,7 @@ async def delete_model_provider(session: SessionDep, ctx: TenantContextDep, id: 
     existing = await ModelProvider.one_by_id(
         session=session,
         id=id,
+        for_update=True,
         options=[selectinload(ModelProvider.model_route_targets)],
     )
     if not existing or existing.deleted_at is not None:
@@ -413,6 +430,43 @@ async def delete_model_provider(session: SessionDep, ctx: TenantContextDep, id: 
         existing,
         not_found_message=f"provider {id} not found",
     )
+    # A decision-service provider pinned by a route's decision policy would
+    # leave the route rendering a dangling providerId after deletion. The
+    # row lock above serializes this check with the route-write path:
+    # `_validate_provider_id` takes the same lock on the provider row, so a
+    # concurrent route write cannot validate and store a new providerId
+    # between the reference scan and the delete commit.
+    if is_decision_config(existing.config):
+        policies = await CapabilityPolicy.all_by_fields(
+            # deleted_at: None matches every other policy read
+            # (`policy_for_route`, `capability_sections`): a soft-deleted
+            # row keeps its old providerId but no longer pins anything.
+            session,
+            fields={"capability": "decision-service", "deleted_at": None},
+        )
+        route_ids = decision_referencing_route_ids(policies, id)
+        if route_ids:
+            # CapabilityPolicy rows carry no owner column, so the route
+            # lookup itself is scoped to the caller: a stale or foreign
+            # policy can neither leak another Org's route names nor block
+            # this delete. References the caller cannot see render inert
+            # (the plugin strips an unresolvable providerId), so deleting
+            # past them is safe.
+            routes = await ModelRoute.all_by_fields(
+                session,
+                extra_conditions=[
+                    ModelRoute.id.in_(route_ids),
+                    *tenant_list_conditions(ctx, ModelRoute),
+                ],
+            )
+            names = sorted(route.name for route in routes)
+            if names:
+                raise BadRequestException(
+                    message=(
+                        "Decision service provider is in use by route(s): "
+                        + ", ".join(names)
+                    )
+                )
     try:
         await existing.delete(session=session)
     except Exception as e:
@@ -423,6 +477,25 @@ async def delete_model_provider(session: SessionDep, ctx: TenantContextDep, id: 
 
 def get_model_name(model: Dict[str, Any]) -> Optional[str]:
     return model.get("id", model.get("name", None))
+
+
+def _normalize_provider_model_id(
+    provider_type: ModelProviderTypeEnum,
+    model_id: Optional[str],
+) -> Optional[str]:
+    """Return the bare model identifier expected by inference and test-model.
+
+    Gemini's ``/v1beta/openai/models`` endpoint prefixes each returned ``id``
+    with ``models/`` (e.g. ``models/gemini-2.5-flash``), whereas both
+    ``/v1beta/openai/chat/completions`` and ai-proxy's
+    ``/{apiVersion}/models/{model}:generateContent`` path take the unprefixed
+    model name.
+    """
+    if not isinstance(model_id, str):
+        return None
+    if provider_type == ModelProviderTypeEnum.GEMINI and model_id.startswith("models/"):
+        model_id = model_id.removeprefix("models/")
+    return model_id or None
 
 
 categories_to_infer = [
@@ -588,10 +661,15 @@ async def get_models_from_provider(
     fallback_created = int(datetime.now(timezone.utc).timestamp())
     for item in data:
         if input.config.type == ModelProviderTypeEnum.DOUBAO:
-            status = item.get("status", None)
-            if status is not None:
-                continue
-        model_id = get_model_name(item)
+            # Ark stamps a lifecycle status on every entry of its model
+            # list ("Published", "Retiring", ...). Both of those still serve
+            # requests -- "Retiring" is scheduled for deprecation, not gone --
+            # so only statuses outside the serving window are hidden.
+            status = item.get("status")
+            if isinstance(status, str) and status:
+                if status.lower() not in ("published", "retiring"):
+                    continue
+        model_id = _normalize_provider_model_id(input.config.type, get_model_name(item))
         if not model_id:
             continue
         categories = determine_model_category(input.config.type, item)

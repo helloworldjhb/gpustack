@@ -4,6 +4,12 @@ import logging
 import os
 from typing import List, Optional, Set
 
+# Memory profiling is independent of the log level because tracing allocations
+# adds overhead to normal debug sessions.
+DEBUG_ENABLE_TRACEMALLOC = (
+    os.getenv("GPUSTACK_DEBUG_ENABLE_TRACEMALLOC", "false").lower() == "true"
+)
+
 # Database configuration
 DB_ECHO = os.getenv("GPUSTACK_DB_ECHO", "false").lower() == "true"
 # Diagnostic: when non-empty, every executed SQL whose text contains this
@@ -152,6 +158,19 @@ def deprecated_ai_statistics_content_types() -> List[str]:
 # recomputation costs one read and no CR write.
 GATEWAY_AUTH_RECONCILE_INTERVAL_SECONDS = int(
     os.getenv("GPUSTACK_GATEWAY_AUTH_RECONCILE_INTERVAL_SECONDS", 30)
+)
+
+# How often ModelRouteController re-derives every live route's gateway
+# artifacts and retires orphaned ones. The steady state is event-driven and
+# the bus does not replay, so this is the worst-case time a route whose
+# triggering event was lost (controller restart, subscription gap, a
+# coordinator that drops changed_fields) keeps a stale destination set.
+# Each pass only reads -- the writes underneath are diff-gated -- but a
+# full sweep costs K8s GETs per route, so the default is conservative and
+# the knob exists for large fleets; set it to 0 to disable the periodic
+# pass entirely.
+GATEWAY_ROUTE_RESYNC_INTERVAL_SECONDS = int(
+    os.getenv("GPUSTACK_GATEWAY_ROUTE_RESYNC_INTERVAL_SECONDS", 300)
 )
 
 # Whether a custom API key -- one whose secret the user supplied rather than
@@ -321,6 +340,43 @@ GPU_INSTANCE_READY_SWEEP_INTERVAL = int(
 # bound (restores the previous unbounded behaviour).
 GPU_INSTANCE_UNREADABLE_CR_TOLERANCE = int(
     os.getenv("GPUSTACK_GPU_INSTANCE_UNREADABLE_CR_TOLERANCE", 1800)
+)  # in seconds
+
+# How long the persistent volume finalizer waits for a cluster it cannot
+# reach before it releases the row anyway. A cluster whose workers are all
+# unreachable may still hold the downstream volume, so the deletion waits for
+# the connection to come back -- but a cluster that stays down must not hold
+# the row forever.
+#
+# NOTE the zero, because the knob above it means the opposite: here 0 is "wait
+# no time at all" -- give up on the cluster and release the row at once, while
+# GPU_INSTANCE_UNREADABLE_CR_TOLERANCE's 0 disables its bound and the hold
+# becomes unbounded. The two sit ten lines apart; do not read one as the other.
+GPU_INSTANCE_PV_FINALIZING_UNREACHABLE_TOLERANCE = int(
+    os.getenv("GPUSTACK_GPU_INSTANCE_PV_FINALIZING_UNREACHABLE_TOLERANCE", 1800)
+)  # in seconds
+
+# How long a GPU instance deletion waits for a cluster it cannot reach before
+# it releases the row anyway. The server reaches the downstream cluster through
+# its own apiserver proxy, which needs a READY worker in the target cluster; a
+# cluster that stays down, loses its READY worker, or loses the network makes
+# the proxy answer 503 and the delete impossible. The row waits for the
+# connection to come back -- but a cluster that stays unreachable must not hold
+# the row in Deleting forever, because the row keeps its name reserved and the
+# user cannot recreate the instance.
+#
+# Past the bound the controller gives up: it releases the row and logs a
+# warning. The downstream custom resource may still exist at that point; the
+# row is released anyway, because a row that can never finalize is worse than a
+# leftover object an operator can clean up.
+#
+# The name pairs it with the persistent volume knob above: both bound the wait
+# for a cluster that cannot be reached while the row is being finalized, and
+# both read 0 the same way -- give up at once. The knob that means the opposite
+# is GPU_INSTANCE_UNREADABLE_CR_TOLERANCE, whose 0 disables its bound and
+# leaves the hold unbounded.
+GPU_INSTANCE_FINALIZING_UNREACHABLE_TOLERANCE = int(
+    os.getenv("GPUSTACK_GPU_INSTANCE_FINALIZING_UNREACHABLE_TOLERANCE", 1800)
 )  # in seconds
 
 # Model instance configuration

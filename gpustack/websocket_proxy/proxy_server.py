@@ -78,7 +78,7 @@ async def _read_line(reader: asyncio.StreamReader) -> Optional[str]:
 
 async def _read_headers(reader: asyncio.StreamReader) -> Dict[str, str]:
     """Read all headers from the client"""
-    headers: Dict[str, str] = {}
+    headers = {}
     while True:
         line = await _read_line(reader)
         if not line:
@@ -87,7 +87,8 @@ async def _read_headers(reader: asyncio.StreamReader) -> Dict[str, str]:
             break
         if ":" in line:
             key, value = line.split(":", 1)
-            headers[key.strip().lower()] = value.strip()
+            name = key.strip().lower()
+            headers[name] = value.strip()
     return headers
 
 
@@ -151,6 +152,18 @@ HOP_BY_HOP_HEADERS = {
     'host',
 }
 
+# Headers whose values are credentials; they are masked in logs so a
+# trace-level capture never records a usable token.
+SENSITIVE_HEADERS = frozenset(('authorization', 'proxy-authorization'))
+
+
+def _redact_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """Copy ``headers`` with credential values masked, for logging."""
+    return {
+        key: ('<redacted>' if key.lower() in SENSITIVE_HEADERS else value)
+        for key, value in headers.items()
+    }
+
 
 def _filter_headers(headers) -> list[tuple[str, str]]:
     """Filter out hop-by-hop headers that should not be forwarded.
@@ -206,10 +219,15 @@ async def _handle_http(
     connection_manager: BaseConnectionManager,
     header_router: Optional[HeaderRouter] = None,
     stall_policy: Optional[StallPolicy] = None,
+    resolved_target: Optional[Tuple[Optional[str], int]] = None,
 ) -> None:
     """Handle HTTP request with full URI"""
     parsed = urlparse(uri)
-    host, port = await header_router(headers) if header_router else (None, 0)
+    host, port = (
+        resolved_target
+        if resolved_target is not None
+        else await header_router(headers) if header_router else (None, 0)
+    )
     # Only requests the header router claimed are inference requests. The same
     # proxy port also carries internal worker APIs -- log following, for one --
     # where a multi-minute silence is normal and a tight inter-chunk budget
@@ -257,6 +275,7 @@ async def _handle_http(
                 expect_body=method != "HEAD",
             ),
         )
+
     except HTTPException as e:
         await client_connection.send_error(e.status_code, e.detail)
     finally:
@@ -275,10 +294,12 @@ def _header_get(headers: list[tuple[str, str]], key: str) -> str:
 _EVENT_STREAM_CONTENT_TYPE = 'text/event-stream'
 
 
-def _parse_response_head(head: bytes) -> Tuple[Optional[int], bool, int]:
-    """Extract ``(content_length, is_event_stream, status_code)`` from a response head."""
+def _parse_response_head(head: bytes) -> Tuple[Optional[int], bool, int, bool]:
+    """Extract ``(content_length, is_event_stream, status_code, is_chunked)`` from
+    a response head."""
     content_length: Optional[int] = None
     is_event_stream = False
+    is_chunked = False
     status_code = 0
 
     lines = head.decode('utf-8', errors='ignore').split('\r\n')
@@ -295,7 +316,9 @@ def _parse_response_head(head: bytes) -> Tuple[Optional[int], bool, int]:
                 pass  # malformed value — fall through to chunked streaming
         elif lowered.startswith('content-type:'):
             is_event_stream = _EVENT_STREAM_CONTENT_TYPE in lowered
-    return content_length, is_event_stream, status_code
+        elif lowered.startswith('transfer-encoding:'):
+            is_chunked = 'chunked' in line.split(':', 1)[1].lower()
+    return content_length, is_event_stream, status_code, is_chunked
 
 
 async def _read_from_remote(
@@ -308,11 +331,87 @@ async def _read_from_remote(
     return await remote_reader.read(timeout=timeout)
 
 
+class _ChunkedBoundaryTracker:
+    """Follows the chunked framing of the body being relayed.
+
+    Raw forwarding leaves the client mid-chunked-decode, so whether an error
+    chunk may be appended on a stall depends on the relay position sitting
+    exactly at a chunk boundary -- which can only be known by parsing the
+    framing as the bytes pass through.
+
+    Malformed framing stops tracking (``at_boundary`` stays false) but does
+    not stop relaying: the client will reject the body either way, and the
+    upstream bytes still belong downstream.
+    """
+
+    def __init__(self) -> None:
+        # Set once the terminating 0-chunk (and its trailer section) arrived.
+        self.finished = False
+        # True only when the relay position is right before a chunk-size line.
+        self.at_boundary = True
+        self._pending = b''
+        self._state = 'size'  # 'size' | 'data' | 'data_crlf' | 'trailer'
+        self._remaining = 0
+        self._dead = False
+
+    def feed(self, data: bytes) -> None:
+        """Consume body bytes as they are forwarded to the client."""
+        if self._dead:
+            return
+        self._pending += data
+        while self._pending and not self.finished:
+            if self._state == 'data':
+                take = min(len(self._pending), self._remaining)
+                self._pending = self._pending[take:]
+                self._remaining -= take
+                if self._remaining == 0:
+                    self._state = 'data_crlf'
+                self.at_boundary = False
+            elif self._state == 'data_crlf':
+                if len(self._pending) < 2:
+                    self.at_boundary = False
+                    return
+                self._pending = self._pending[2:]
+                self._state = 'size'
+                self.at_boundary = True
+            else:
+                # 'size' and 'trailer' both parse one CRLF-delimited line.
+                line_end = self._pending.find(b'\r\n')
+                if line_end < 0:
+                    self.at_boundary = False
+                    return
+                line = self._pending[:line_end]
+                self._pending = self._pending[line_end + 2 :]
+                if self._state == 'trailer':
+                    if not line:
+                        self.finished = True
+                        self.at_boundary = False
+                    continue
+                size_field = line.split(b';', 1)[0]
+                try:
+                    size = int(size_field.strip() or b'x', 16)
+                except ValueError:
+                    # Unparseable framing: give up tracking, keep relaying.
+                    self._dead = True
+                    self.at_boundary = False
+                    self._pending = b''
+                    return
+                if size == 0:
+                    self._state = 'trailer'
+                    self.at_boundary = False
+                else:
+                    self._remaining = size
+                    self._state = 'data'
+                    self.at_boundary = False
+
+
 async def _report_stall(
     client_writer: IOConnection,
     stall_policy: Optional[StallPolicy],
     headers_sent: bool,
     is_event_stream: bool,
+    is_chunked: bool = False,
+    at_chunk_boundary: bool = True,
 ) -> None:
     """Tell the client the upstream stopped responding.
 
@@ -321,6 +420,13 @@ async def _report_stall(
     honest ending for a stream is a terminal error event -- just dropping the
     connection is indistinguishable from a finished generation, which is the
     symptom this exists to remove.
+
+    A chunked response carries the error event inside a final data chunk
+    followed by the terminating ``0\\r\\n\\r\\n``: the relay forwards upstream
+    bytes raw, so the client is mid-chunked-decode and bare SSE text would be
+    read as a malformed chunk size line. And that chunk is only valid at a
+    chunk boundary -- mid-chunk, nothing can be appended, so the response ends
+    without the error event rather than with a corrupt one.
     """
     if stall_policy is None:
         logger.debug("[Proxy] Timeout waiting for response")
@@ -340,11 +446,20 @@ async def _report_stall(
                 b"\r\n" + body
             )
         elif is_event_stream:
+            if is_chunked and not at_chunk_boundary:
+                logger.error(
+                    "[Proxy] Upstream stalled mid-chunk, closing without an "
+                    "error event"
+                )
+                return
             logger.error(
                 "[Proxy] Upstream stalled mid-stream, terminating the response "
                 "with an error event"
             )
-            await client_writer.write(stall_policy.error_sse)
+            payload = stall_policy.error_sse
+            if is_chunked:
+                payload = b"%x\r\n%s\r\n0\r\n\r\n" % (len(payload), payload)
+            await client_writer.write(payload)
         else:
             # Nothing meaningful can be appended to a half-delivered body.
             logger.error("[Proxy] Upstream stalled mid-response, closing")
@@ -368,6 +483,7 @@ async def wait_for_complete_response(  # noqa: C901
     response head is held until that byte arrives, so a stall before it becomes a
     504 rather than a 200 that never produces data. Without one, the behavior is
     unchanged.
+
     """
     if client_writer is None:
         logger.debug("[Proxy] Client writer is None")
@@ -383,6 +499,8 @@ async def wait_for_complete_response(  # noqa: C901
     content_length: Optional[int] = None
     body_remaining: Optional[int] = None
     is_event_stream = False
+    is_chunked = False
+    chunk_tracker = _ChunkedBoundaryTracker()
 
     def read_timeout() -> Optional[float]:
         if stall_policy is None:
@@ -424,9 +542,12 @@ async def wait_for_complete_response(  # noqa: C901
                 header_end = pending_data.find(b'\r\n\r\n') + 4
                 head = pending_data[:header_end]
                 pending_data = pending_data[header_end:]
-                content_length, is_event_stream, status_code = _parse_response_head(
-                    head
-                )
+                (
+                    content_length,
+                    is_event_stream,
+                    status_code,
+                    is_chunked,
+                ) = _parse_response_head(head)
                 body_remaining = content_length
                 logger.trace(
                     f"[Proxy] Head parsed, content_length={content_length}, "
@@ -465,10 +586,24 @@ async def wait_for_complete_response(  # noqa: C901
                     return
             else:
                 # No Content-Length: stream until source closes (chunked encoding)
+                if is_chunked:
+                    chunk_tracker.feed(pending_data)
                 await client_writer.write(pending_data)
                 pending_data = b''
+                if chunk_tracker.finished:
+                    # The terminating chunk arrived: the response is complete
+                    # even though a keep-alive upstream keeps the connection
+                    # open, and waiting further would read the next response.
+                    return
     except (asyncio.TimeoutError, TimeoutError):
-        await _report_stall(client_writer, stall_policy, headers_sent, is_event_stream)
+        await _report_stall(
+            client_writer,
+            stall_policy,
+            headers_sent,
+            is_event_stream,
+            is_chunked,
+            chunk_tracker.at_boundary,
+        )
         return
     except Exception as e:
         logger.debug(f"[Proxy] Error waiting for complete response: {e}")
@@ -517,14 +652,22 @@ class HTTPSProxyServer:
             await self.server.wait_closed()
 
     async def _get_target_ip(
-        self, method: str, uri: str, headers: Dict[str, str]
+        self,
+        method: str,
+        uri: str,
+        headers: Dict[str, str],
+        resolved_target: Optional[Tuple[Optional[str], int]] = None,
     ) -> Optional[str]:
         """Extract target IP/hostname from request"""
         if method == "CONNECT":
             # CONNECT target is the host:port (e.g., "example.com:443")
             return uri.split(":")[0] if ":" in uri else uri
         elif self.header_router:
-            target_ip, _ = await self.header_router(headers)
+            target_ip, _ = (
+                resolved_target
+                if resolved_target is not None
+                else await self.header_router(headers)
+            )
             if target_ip:
                 return target_ip
 
@@ -556,18 +699,30 @@ class HTTPSProxyServer:
 
             headers = await _read_headers(reader)
             logger.debug(f"[Proxy] Received request: {method} {uri} from {client_addr}")
-            logger.trace(f"[Proxy] Headers: {headers}")
+            logger.trace(f"[Proxy] Headers: {_redact_headers(headers)}")
 
-            # Authenticate before any other processing
-            # Skip authenticator for /metrics path on non-CONNECT requests
-            result = urlparse(uri)
-            should_skip_auth = method == "GET" and result.path == "/metrics"
-            if self.authenticator and not should_skip_auth:
+            # Authenticate before any other processing. No method or path is
+            # exempt: an exemption derived from the client-controlled URI
+            # would let an unauthenticated caller reach any host behind a
+            # registered tunnel.
+            if self.authenticator:
                 if not await self.authenticator(headers):
                     await client_connection.send_error(401, "Unauthorized")
                     return
             # Extract target address from request
-            target_ip = await self._get_target_ip(method, uri, headers)
+            resolved_target = (
+                await self.header_router(headers) if self.header_router else None
+            )
+            if (
+                method == "CONNECT"
+                and resolved_target
+                and resolved_target[0] is not None
+            ):
+                await client_connection.send_error(
+                    400, "Model destinations require an HTTP request"
+                )
+                return
+            target_ip = await self._get_target_ip(method, uri, headers, resolved_target)
             if not target_ip:
                 await client_connection.send_error(
                     400, "Bad Request: No target address"
@@ -601,8 +756,11 @@ class HTTPSProxyServer:
                     connection_manager,
                     self.header_router,
                     self.stall_policy,
+                    resolved_target,
                 )
 
+        except HTTPException as exc:
+            await client_connection.send_error(exc.status_code, str(exc.detail))
         except Exception as e:
             logger.debug(f"[Proxy] Error handling {client_addr}: {e}")
         finally:

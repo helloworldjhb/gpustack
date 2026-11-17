@@ -17,7 +17,7 @@ from gpustack_runtime.detector import (
     available_manufacturers,
     available_backends,
 )
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from gpustack.utils import validators
 from gpustack.schemas.workers import (
@@ -197,6 +197,7 @@ class Config(WorkerConfig, BaseSettings):
         allow_headers: A list of HTTP request headers that should be supported for cross-origin requests.
         server_external_url: Specified external URL for the server.
         system_default_container_registry: Default registry for container images (server and inference images). Images are expected under the 'gpustack' namespace; for multi-level namespaces keep 'gpustack' as the last level and set this to the parent path.
+        container_namespace: Namespace for default GPUStack container images, including worker, runner and runtime images. Explicit worker image overrides take precedence.
         image_name_override: Force override of the image name.
         image_repo: Repository for the container images. When the image lives outside the 'gpustack' namespace (e.g. 'gpustack-ai/gpustack'), point system_default_container_registry to the parent namespace path and set this to the remaining repository path.
         service_discovery_name: Name of the service discovery service in DNS. Only useful when deployed in Kubernetes with service discovery.
@@ -205,6 +206,10 @@ class Config(WorkerConfig, BaseSettings):
         gateway_concurrency: Number of concurrent connections for the embedded gateway. Default is 16.
         gateway_namespace: The namespace where the gateway component is deployed.
         namespace: Kubernetes namespace for GPUStack to deploy gateway routing rules and model instances.
+        trusted_proxy_cidrs: CIDR networks of proxies in front of the gateway whose X-Forwarded-For
+                             appends are honored when resolving the client IP. Unset means only the
+                             entry the gateway appended is trusted, so forwarded headers cannot spoof
+                             the source address.
         disable_builtin_observability: Disable embedded Grafana and Prometheus services.
         prometheus_url: Base URL of an external Prometheus to query. When unset, the embedded one is used if it is enabled. Set this to keep the server's own metric queries working on a deployment that delegates observability to its own stack.
         grafana_url: Base URL for Grafana UI used by redirects and proxying. When unset, defaults to the embedded Grafana URL unless builtin observability is disabled.
@@ -343,6 +348,15 @@ class Config(WorkerConfig, BaseSettings):
     gateway_concurrency: int = 16
     gateway_plugin_server_url: Optional[str] = None
     gateway_ingress_class: str = "higress"
+    # CIDR networks of the proxies deployed in front of the gateway.
+    # ``client_ip_getter`` walks X-Forwarded-For from the right and skips
+    # entries inside these networks (addresses trusted proxies appended);
+    # the first entry outside them is the client. Unset means no hop is
+    # trusted, so only the entry the gateway itself appended is used and a
+    # client cannot spoof its source address with forwarded headers. List a
+    # front proxy's subnet only when that proxy appends X-Forwarded-For (or
+    # overwrites it with the address it observed) itself.
+    trusted_proxy_cidrs: Optional[List[str]] = None
     # Per-plugin overrides, keyed by the plugin's *manifest* name -- the one
     # ``supported_plugins`` and the module URL are built from, which for five of
     # the eight plugins differs from the WasmPlugin resource name they appear
@@ -482,6 +496,23 @@ class Config(WorkerConfig, BaseSettings):
         self._derive_auth_cache_key = hmac.new(
             self.jwt_secret_key.encode(), b"gateway-auth-cache", hashlib.sha256
         ).hexdigest()
+
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def _validate_trusted_proxy_cidrs(cls, value):
+        # Fail at startup rather than at request time: an invalid entry here
+        # would otherwise be discovered as a client IP that silently fails to
+        # resolve.
+        if value is None:
+            return value
+        for cidr in value:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                raise ValueError(
+                    f'Invalid CIDR network "{cidr}" in trusted_proxy_cidrs.'
+                )
+        return value
 
     @model_validator(mode="after")
     def check_all(self):  # noqa: C901
@@ -1156,10 +1187,30 @@ class Config(WorkerConfig, BaseSettings):
         return self._derive_auth_cache_key
 
 
+def has_custom_container_namespace(container_namespace: Optional[str]) -> bool:
+    """Return whether the value changes the default ``gpustack`` namespace."""
+    return (container_namespace or "").strip().strip("/") not in ("", "gpustack")
+
+
+def apply_container_namespace_to_image(
+    image: str, container_namespace: Optional[str]
+) -> str:
+    """Replace the namespace of GPUStack's default image references.
+
+    References in another namespace already identify their repository and stay
+    unchanged. Full image overrides are returned before reaching this helper.
+    """
+    namespace = (container_namespace or "").strip().strip("/")
+    if namespace and image.startswith("gpustack/"):
+        return f"{namespace}/{image.removeprefix('gpustack/')}"
+    return image
+
+
 def get_image_name(
     image_name_override: Optional[str],
     registry: Optional[str] = None,
     image_repo: str = "gpustack/gpustack",
+    container_namespace: Optional[str] = None,
 ) -> str:
     if image_name_override:
         return image_name_override
@@ -1170,6 +1221,7 @@ def get_image_name(
     if version.removeprefix("v") == "0.0.0":
         version = "dev"
     prefix = f"{registry}/" if registry else ""
+    image_repo = apply_container_namespace_to_image(image_repo, container_namespace)
     return f"{prefix}{image_repo}:{version}"
 
 
@@ -1181,17 +1233,32 @@ def get_cluster_image_name(
     registry = determine_default_registry(
         cluster_registry or cfg.system_default_container_registry
     )
-    if worker_config is None:
-        return get_image_name(
-            image_repo=cfg.image_repo,
-            image_name_override=cfg.image_name_override,
-            registry=registry,
-        )
+    cluster_override = worker_config.image_name_override if worker_config else None
+    cluster_repo = worker_config.image_repo if worker_config else None
+    cluster_namespace = worker_config.container_namespace if worker_config else None
+    # The server-level override typically comes from the Helm chart and pins
+    # the exact image the server runs. It is the default for a cluster that
+    # pins nothing about where its own workers pull from — but a full
+    # reference, so once a cluster sets a registry, repository or custom
+    # namespace those explicit settings decide the image instead of being
+    # swallowed whole.
+    server_override = (
+        cfg.image_name_override
+        if cluster_registry is None
+        and cluster_repo is None
+        and not has_custom_container_namespace(cluster_namespace)
+        else None
+    )
+    container_namespace = (
+        cluster_namespace if cluster_namespace is not None else cfg.container_namespace
+    )
+    if cluster_repo is not None:
+        container_namespace = None
     return get_image_name(
-        image_name_override=worker_config.image_name_override
-        or cfg.image_name_override,
-        image_repo=worker_config.image_repo or cfg.image_repo,
+        image_name_override=cluster_override or server_override,
+        image_repo=cluster_repo or cfg.image_repo,
         registry=registry,
+        container_namespace=container_namespace,
     )
 
 

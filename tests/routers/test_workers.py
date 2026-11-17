@@ -5,12 +5,14 @@ import pytest
 
 from gpustack.api.exceptions import ForbiddenException, NotFoundException
 from gpustack.routes.workers import (
+    _build_worker_config_dict,
+    check_existing_worker_ownership,
     delete_worker,
     get_worker_privatekey,
     update_worker,
     update_worker_data,
 )
-from gpustack.schemas.principals import OrgRole
+from gpustack.schemas.principals import OrgRole, PrincipalType
 from gpustack.schemas.workers import (
     Worker,
     WorkerCreate,
@@ -21,6 +23,46 @@ from gpustack.schemas.workers import (
     SystemReserved,
 )
 from gpustack.schemas.clusters import Cluster, ClusterProvider
+from gpustack.schemas.config import PredefinedConfigNoDefaults
+
+
+def test_worker_config_inherits_the_server_container_namespace(monkeypatch):
+    server_config = SimpleNamespace(
+        system_default_container_registry=None,
+        container_namespace="gpustack-ai",
+    )
+    monkeypatch.setattr(
+        "gpustack.routes.workers.get_global_config", lambda: server_config
+    )
+    cluster = Cluster(
+        name="c",
+        worker_config=PredefinedConfigNoDefaults(),
+    )
+
+    config = _build_worker_config_dict(cluster)
+
+    assert config["container_namespace"] == "gpustack-ai"
+
+
+@pytest.mark.parametrize("cluster_namespace", ["cluster-org", ""])
+def test_cluster_container_namespace_overrides_the_server(
+    monkeypatch, cluster_namespace
+):
+    server_config = SimpleNamespace(
+        system_default_container_registry=None,
+        container_namespace="gpustack-ai",
+    )
+    monkeypatch.setattr(
+        "gpustack.routes.workers.get_global_config", lambda: server_config
+    )
+    cluster = Cluster(
+        name="c",
+        worker_config=PredefinedConfigNoDefaults(container_namespace=cluster_namespace),
+    )
+
+    config = _build_worker_config_dict(cluster)
+
+    assert config["container_namespace"] == cluster_namespace
 
 
 def test_update_worker_data_preserves_maintenance_mode():
@@ -229,7 +271,15 @@ def _worker(owner_principal_id=None, deleted_at=None):
         ssh_key_id=None,
         external_id=None,
         state=WorkerStateEnum.READY,
+        worker_uuid="6f1c3f0e-1a5b-4c6d-9e7f-2b8a4d0c5e11",
     )
+
+
+def _request(handler=None):
+    """Stub the request the delete route uses to reach the tunnel registry."""
+    request = MagicMock()
+    request.app.state.message_server_handler = handler
+    return request
 
 
 def _patch_worker_one_by_id(worker):
@@ -252,7 +302,7 @@ async def test_delete_worker_allowed_for_org_admin_in_owning_org():
     ):
         service = service_cls.return_value
         service.delete = AsyncMock()
-        await delete_worker(ctx=ctx, session=session, id=worker.id)
+        await delete_worker(request=_request(), ctx=ctx, session=session, id=worker.id)
         service.delete.assert_awaited_once()
 
 
@@ -264,7 +314,9 @@ async def test_delete_worker_forbidden_for_plain_org_user():
 
     with _patch_worker_one_by_id(worker):
         with pytest.raises(ForbiddenException):
-            await delete_worker(ctx=ctx, session=session, id=worker.id)
+            await delete_worker(
+                request=_request(), ctx=ctx, session=session, id=worker.id
+            )
 
 
 @pytest.mark.asyncio
@@ -276,7 +328,9 @@ async def test_delete_worker_returns_not_found_for_other_org():
 
     with _patch_worker_one_by_id(worker):
         with pytest.raises(NotFoundException):
-            await delete_worker(ctx=ctx, session=session, id=worker.id)
+            await delete_worker(
+                request=_request(), ctx=ctx, session=session, id=worker.id
+            )
 
 
 @pytest.mark.asyncio
@@ -291,7 +345,9 @@ async def test_delete_worker_on_globally_shared_cluster_requires_platform_admin(
 
     with _patch_worker_one_by_id(worker):
         with pytest.raises(ForbiddenException):
-            await delete_worker(ctx=ctx, session=session, id=worker.id)
+            await delete_worker(
+                request=_request(), ctx=ctx, session=session, id=worker.id
+            )
 
 
 @pytest.mark.asyncio
@@ -306,7 +362,7 @@ async def test_delete_worker_allowed_for_platform_admin():
     ):
         service = service_cls.return_value
         service.delete = AsyncMock()
-        await delete_worker(ctx=ctx, session=session, id=worker.id)
+        await delete_worker(request=_request(), ctx=ctx, session=session, id=worker.id)
         service.delete.assert_awaited_once()
 
 
@@ -324,7 +380,9 @@ async def test_delete_already_soft_deleted_worker_returns_not_found():
 
     with _patch_worker_one_by_id(worker):
         with pytest.raises(NotFoundException):
-            await delete_worker(ctx=ctx, session=session, id=worker.id)
+            await delete_worker(
+                request=_request(), ctx=ctx, session=session, id=worker.id
+            )
 
 
 @pytest.mark.asyncio
@@ -423,9 +481,8 @@ async def test_get_worker_privatekey_for_soft_deleted_worker_returns_not_found()
 
 def test_worker_visibility_filter_scopes_cluster_bound_system():
     """The watch-stream row filter must narrow a cluster-bound SYSTEM
-    account to its own cluster — the plain SYSTEM bypass would otherwise
-    leak every cluster's workers."""
-    from gpustack.routes.workers import _make_worker_visibility_filter
+    account to workers with matching cluster and owner bindings."""
+    from gpustack.api.tenant import tenant_stream_filter
     from gpustack.schemas.principals import PrincipalType
 
     scoped = SimpleNamespace(
@@ -433,10 +490,14 @@ def test_worker_visibility_filter_scopes_cluster_bound_system():
         is_platform_admin=False,
         current_principal_id=None,
         scoped_cluster_id=3,
+        scoped_cluster_owner_id=10,
     )
-    visible = _make_worker_visibility_filter(scoped)
-    assert visible(SimpleNamespace(cluster_id=3, owner_principal_id=None))
-    assert not visible(SimpleNamespace(cluster_id=4, owner_principal_id=None))
+    visible = tenant_stream_filter(scoped, Worker)
+    assert visible(SimpleNamespace(cluster_id=3, owner_principal_id=10))
+    assert not visible(SimpleNamespace(cluster_id=3, owner_principal_id=None))
+    assert not visible(SimpleNamespace(cluster_id=3, owner_principal_id=20))
+    assert not visible(SimpleNamespace(cluster_id=4, owner_principal_id=10))
+    assert not visible(SimpleNamespace(cluster_id=None, owner_principal_id=10))
 
     # Legacy SYSTEM principal (no cluster linkage) keeps the full bypass.
     legacy = SimpleNamespace(
@@ -445,7 +506,7 @@ def test_worker_visibility_filter_scopes_cluster_bound_system():
         current_principal_id=None,
         scoped_cluster_id=None,
     )
-    assert _make_worker_visibility_filter(legacy)(
+    assert tenant_stream_filter(legacy, Worker)(
         SimpleNamespace(cluster_id=4, owner_principal_id=None)
     )
 
@@ -475,7 +536,6 @@ async def test_worker_list_batches_allocations_for_visible_workers(monkeypatch):
     monkeypatch.setattr(route.Worker, "paginated_by_query", query)
     conditions = ["tenant visibility"]
     monkeypatch.setattr(route, "tenant_list_conditions", lambda *args: conditions)
-    monkeypatch.setattr(route, "_make_worker_visibility_filter", lambda ctx: None)
     allocations = AsyncMock(
         return_value={1: Allocated(ram=10, vram={}), 2: Allocated(ram=20, vram={})}
     )
@@ -495,3 +555,119 @@ async def test_worker_list_batches_allocations_for_visible_workers(monkeypatch):
     assert [
         worker.model_dump()["status"]["memory"]["allocated"] for worker in result.items
     ] == [10, 20]
+
+
+def _registration_record(worker_id, worker_uuid):
+    return Worker(
+        id=worker_id,
+        name='worker-%d' % worker_id,
+        cluster_id=1,
+        hostname='host-%d' % worker_id,
+        ip='10.0.0.%d' % worker_id,
+        ifname='eth0',
+        port=8080,
+        worker_uuid=worker_uuid,
+        status=WorkerStatus.get_default_status(),
+    )
+
+
+def _worker_user(worker_id):
+    worker = SimpleNamespace(id=worker_id)
+    return SimpleNamespace(
+        is_admin=False,
+        worker=worker,
+        cluster=None,
+        kind=PrincipalType.SYSTEM,
+        id=1,
+        name='system-worker',
+    )
+
+
+def test_re_registration_cannot_rewrite_worker_uuid():
+    # A re-registration may carry any worker_uuid (legacy lookup echo, or a
+    # forged one): the stored identity must survive the merge untouched.
+    existing = _registration_record(1, 'own-uuid')
+    worker_in = WorkerCreate(
+        name='worker-1',
+        hostname='host-1',
+        ip='10.0.0.5',
+        ifname='eth0',
+        port=8080,
+        worker_uuid='victim-uuid',
+        cluster_id=1,
+        status=WorkerStatus.get_default_status(),
+    )
+
+    merged = update_worker_data(worker_in, existing=existing)
+
+    assert merged.worker_uuid == 'own-uuid'
+
+
+def test_re_registration_heals_dirty_local_uuid():
+    # A worker whose data dir holds a uuid from another server reports it,
+    # no record matches, and the record it does find keeps its own uuid;
+    # the registration response then overwrites the local file.
+    existing = _registration_record(1, 'server-assigned-uuid')
+    worker_in = WorkerCreate(
+        name='worker-1',
+        hostname='host-1',
+        ip='10.0.0.1',
+        ifname='eth0',
+        port=8080,
+        worker_uuid='stale-uuid-from-other-server',
+        cluster_id=1,
+        status=WorkerStatus.get_default_status(),
+    )
+
+    merged = update_worker_data(worker_in, existing=existing)
+
+    assert merged.worker_uuid == 'server-assigned-uuid'
+
+
+def test_re_registration_of_own_record_is_allowed():
+    user = _worker_user(worker_id=1)
+    record = _registration_record(1, 'own-uuid')
+
+    check_existing_worker_ownership(user, record)
+
+
+def test_re_registration_of_another_workers_record_is_forbidden():
+    # get_existing_worker matches caller-supplied keys (uuid, name plus a
+    # self-reported label); none of them proves ownership, so a worker
+    # credential must not be able to adopt a record it can name.
+    user = _worker_user(worker_id=2)
+    record = _registration_record(1, 'victim-uuid')
+
+    with pytest.raises(ForbiddenException):
+        check_existing_worker_ownership(user, record)
+
+
+@pytest.mark.parametrize(
+    'user',
+    [
+        SimpleNamespace(
+            is_admin=True,
+            worker=None,
+            cluster=None,
+            kind=PrincipalType.USER,
+            id=1,
+            name='admin',
+        ),
+        SimpleNamespace(
+            is_admin=False,
+            worker=None,
+            cluster=SimpleNamespace(id=1),
+            kind=PrincipalType.SYSTEM,
+            id=2,
+            name='system-cluster',
+        ),
+    ],
+)
+def test_cross_worker_authority_may_re_register_any_record(user):
+    record = _registration_record(1, 'some-uuid')
+
+    check_existing_worker_ownership(user, record)
+
+
+def test_no_existing_record_is_always_allowed():
+    check_existing_worker_ownership(_worker_user(worker_id=1), None)

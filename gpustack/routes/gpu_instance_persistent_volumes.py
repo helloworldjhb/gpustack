@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
+from gpustack.api.streaming import tenant_streaming
 from gpustack.api.exceptions import (
+    HTTPException as APIHTTPException,
     AlreadyExistsException,
     ConflictException,
     InternalServerErrorException,
@@ -77,7 +79,9 @@ async def get_gpu_instance_persistent_volumes(
 
     if params.watch:
         return StreamingResponse(
-            GPUInstancePersistentVolume.streaming(
+            tenant_streaming(
+                GPUInstancePersistentVolume,
+                ctx,
                 fields=fields,
                 fuzzy_fields=fuzzy_fields,
                 event_transform=_inject_attachments_into_event,
@@ -351,6 +355,8 @@ def is_visible(obj, ctx: TenantContext) -> bool:
 async def handle_error(message: str):
     try:
         yield
+    except APIHTTPException:
+        raise
     except Exception as e:
         raise InternalServerErrorException(
             message=message,

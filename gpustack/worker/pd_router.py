@@ -18,9 +18,17 @@ catalog entry keeps the router under `router:` and not under `roles:`.
 """
 
 import logging
-from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence
+import shlex
+from typing import TYPE_CHECKING, Dict, List, Mapping, NamedTuple, Optional, Sequence
 
 from pydantic import BaseModel
+
+from gpustack.utils.command import (
+    find_last_int_parameter,
+    find_last_parameter,
+    flatten_to_argv,
+    is_parameter_key,
+)
 
 from gpustack.schemas.pd_modes import (
     PDMode,
@@ -28,9 +36,17 @@ from gpustack.schemas.pd_modes import (
     PDRouter,
     PDRouterProtocolEnum,
 )
-from gpustack.utils.template import render
+from gpustack.utils.pd_router_launch import resolve_router_launch
+from gpustack.utils.template import render, render_values
+from gpustack.utils.pd_router_command import (
+    render_router_command_template,
+    router_environment,
+)
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from gpustack.schemas.models import ModelBase, ModelInstance
 
 
 class PeerAddress(NamedTuple):
@@ -81,6 +97,136 @@ class RouterPeersUnavailable(Exception):
     partial one silently halves the group. PD failures are invisible from the
     outside, so degrading here would be lying.
     """
+
+
+def static_hybrid_router_variables(
+    model: "ModelBase",
+    instances: Sequence["ModelInstance"],
+    group_id: Optional[str],
+) -> Dict[str, int]:
+    """Derive the common Engine scope required by a static Mooncake router.
+
+    Args:
+        model: The original deployment specification, before role projection.
+        instances: Current deployment instances, including their allocated tasks.
+        group_id: The Router's communication group.
+
+    Returns:
+        Transient rendering variables for a managed Hybrid Mooncake Router.
+    """
+    from gpustack.schemas.models import (
+        find_role,
+        role_effective_model,
+    )
+    from gpustack.utils.model_instance_workers import (
+        get_model_instance_workloads,
+        model_instance_endpoints,
+    )
+
+    disaggregation = getattr(model, "disaggregation", None)
+    if disaggregation is None or disaggregation.mode.value != "vllm-mooncake":
+        return {}
+    router = find_role(model, "router")
+    if router is not None and router.run_command:
+        return {}
+    endpoints = [
+        (instance, endpoint)
+        for instance in instances
+        if instance.group_id == group_id
+        and instance.role in ("prefill", "decode")
+        and getattr(instance, "deleted_at", None) is None
+        for endpoint in model_instance_endpoints(instance)
+    ]
+    if not any(endpoint.component == "vllm_hybrid" for _, endpoint in endpoints):
+        return {}
+    sizes = set()
+    for instance, endpoint in endpoints:
+        if endpoint.component == "vllm_hybrid":
+            task = next(
+                (
+                    task
+                    for task in get_model_instance_workloads(instance) or []
+                    if task.worker_id == endpoint.worker_id
+                ),
+                None,
+            )
+            if task is None:
+                raise ValueError(
+                    f"Hybrid endpoint for instance {instance.id} on "
+                    f"Worker {endpoint.worker_id} has no matching workload."
+                )
+            sizes.add(task.component.dp_size)
+        elif endpoint.dp_rank is not None:
+            sizes.add(1)
+        else:
+            effective = role_effective_model(model, instance.role)
+            sizes.add(_internal_api_dp_size(effective, instance))
+    if len(sizes) != 1:
+        raise ValueError(
+            "CUDA Mooncake shared APIs must have the same local DP size; "
+            "the static router has only one --intra-node-data-parallel-size."
+        )
+    return {"intra_node_data_parallel_size": sizes.pop()}
+
+
+def _internal_api_dp_size(model, instance) -> int:
+    """An Internal API addresses the full DP group, including remote Engines."""
+    parameters = model.backend_parameters
+    names = ["data-parallel-size", "dp"]
+    raw = find_last_parameter(parameters, names)
+    if raw is not None:
+        value = find_last_int_parameter(parameters, names)
+        if value is not None and value > 0:
+            return value
+        raise ValueError("Cannot determine the Internal API data parallel size.")
+    from gpustack.utils.vllm_topology import (
+        parse_user_parallelism,
+        validate_multinode_topology,
+    )
+
+    servers = instance.distributed_servers
+    members = [instance] + list(servers.subordinate_workers or [] if servers else [])
+    counts = [len(member.gpu_indexes or []) for member in members]
+    return validate_multinode_topology(counts, parse_user_parallelism(parameters)).dp
+
+
+def _static_hybrid_router_parameters(parameters, expected: int) -> List[str]:
+    """Keep one platform-rendered DP flag while retaining other user options."""
+    flag = "--intra-node-data-parallel-size"
+    tokens = flatten_to_argv(parameters)
+    result, overrides = [], []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        name, separator, value = token.partition("=")
+        # Both supported wheels use argparse's unambiguous long-option prefixes.
+        if len(name) > 2 and name.startswith("--") and flag.startswith(name):
+            if not separator:
+                index += 1
+                value = tokens[index] if index < len(tokens) else ""
+            try:
+                overrides.append(int(value))
+            except ValueError as exc:
+                raise ValueError(f"{flag} requires an integer value.") from exc
+        else:
+            result.append(token)
+        index += 1
+    if overrides and overrides[-1] != expected:
+        raise ValueError(f"{flag} must match the shared API local DP {expected}.")
+    if not overrides:
+        return list(parameters or [])
+    # These fragments are parsed again when the Custom backend builds its argv.
+    # Quote values inside their option rather than storing unquoted argv tokens.
+    fragments = []
+    for token in result:
+        key, separator, value = token.partition('=')
+        if is_parameter_key(key):
+            fragments.append(f'{key}={shlex.quote(value)}' if separator else key)
+        elif fragments and is_parameter_key(fragments[-1]):
+            fragments[-1] += ' ' + shlex.quote(token)
+        else:
+            fragments.append(token)
+    return fragments
 
 
 def _peer_scope(peer: PeerAddress) -> Dict[str, object]:
@@ -165,36 +311,21 @@ def render_router(
     command = [
         render(part, variables, context="router command") for part in router.command
     ]
+    if mode.name == "vllm-mooncake" and "intra_node_data_parallel_size" in variables:
+        command.extend(
+            [
+                "--intra-node-data-parallel-size",
+                str(variables["intra_node_data_parallel_size"]),
+            ]
+        )
 
     # Peer flags go after the declared command rather than interleaved: the
     # catalog's command is the invariant part of the invocation and the peer
     # list is the part that changes on every scale, and keeping them apart is
     # what lets a scale re-render the tail without re-deriving the head.
-    peer_args: List[str] = []
-    for role, spec in (
-        ("prefill", router.peers.prefill),
-        ("decode", router.peers.decode),
-    ):
-        if not spec:
-            continue
-        addresses = list(peers.get(role) or [])
-        if not addresses:
-            raise RouterPeersUnavailable(
-                f"No {role} address is available for the router. The router is "
-                f"created only after its dependencies report ready, so this "
-                f"means a member was lost between that check and this render."
-            )
-        if router.peers.style == PDPeerStyleEnum.REPEATED_FLAG:
-            peer_args.extend(_repeated_flag(spec, addresses))
-        elif router.peers.style == PDPeerStyleEnum.PARALLEL_LISTS:
-            peer_args.extend(_parallel_lists(spec, addresses))
-        else:
-            # Unreachable: the catalog loader rejects unknown styles, which is
-            # what keeps "a new wire protocol needs code" from being discovered
-            # at render time on a user's cluster.
-            raise RouterPeersUnavailable(
-                f"Peer style '{router.peers.style}' has no renderer."
-            )
+    peer_args = _router_peer_args(router, peers, "prefill") + _router_peer_args(
+        router, peers, "decode"
+    )
 
     return RouterPlan(
         image=render(router.image, variables, context="router image"),
@@ -209,64 +340,60 @@ def render_router(
     )
 
 
-def is_managed_router(model, role_name: Optional[str]) -> bool:
-    """Whether this role is a router GPUStack assembles rather than one the
-    user supplied.
+def _router_peer_args(router: PDRouter, peers: PeerMap, role: str) -> List[str]:
+    spec = getattr(router.peers, role)
+    if not spec:
+        return []
+    addresses = list(peers.get(role) or [])
+    if not addresses:
+        raise RouterPeersUnavailable(
+            f"No {role} address is available for the router. The router is "
+            f"created only after its dependencies report ready, so this "
+            f"means a member was lost between that check and this render."
+        )
+    if router.peers.style == PDPeerStyleEnum.REPEATED_FLAG:
+        return _repeated_flag(spec, addresses)
+    if router.peers.style == PDPeerStyleEnum.PARALLEL_LISTS:
+        return _parallel_lists(spec, addresses)
+    raise RouterPeersUnavailable(f"Peer style '{router.peers.style}' has no renderer.")
 
-    Derived, not declared. `RoleSpec` has no `managed` flag and deliberately so:
-    "managed" is exactly "the user did not give it an image and a command", and
-    a separate boolean could disagree with that — a role marked managed while
-    carrying a hand-written command would have to resolve which one wins, and
-    every answer to that is surprising to somebody.
 
-    Note that only *both* opt out. Supplying one of the two leaves this
-    managed, and `apply_managed_router` then fills in the half that was left
-    open — which is what lets a router run from an image of the user's choosing
-    without also making them write the invocation.
-    """
-    return _managed_router(model, role_name) is not None
+def is_managed_router(model, role_name: Optional[str], inference_backend=None) -> bool:
+    """Whether GPUStack assembles this Router's selected launch configuration."""
+    return _managed_router(model, role_name, inference_backend) is not None
 
 
-def _managed_router(model, role_name: Optional[str]) -> Optional[PDRouter]:
-    """The catalog's router declaration for a role GPUStack launches itself.
-
-    None for every reason there is not one: the member is not the router, the
-    deployment is not disaggregated, the role brought both an image and a
-    command, or the recipe leaves the router to the user. Callers that only
-    want the yes/no go through `is_managed_router`; the ones that need the
-    declaration take it from here rather than resolving the catalog a second
-    time.
-    """
+def _managed_router(
+    model, role_name: Optional[str], inference_backend=None
+) -> Optional[PDRouter]:
     from gpustack.schemas.models import RoleNameEnum, find_role
+    from gpustack.server.pd_mode_catalog import get_pd_mode
 
-    if role_name != RoleNameEnum.ROUTER.value:
+    if role_name != RoleNameEnum.ROUTER.value or find_role(model, role_name) is None:
         return None
     disaggregation = getattr(model, "disaggregation", None)
     if disaggregation is None:
         return None
-
-    role = find_role(model, role_name)
-    if role is not None and role.image_name and role.run_command:
-        return None
-
-    from gpustack.server.pd_mode_catalog import get_pd_mode
-
     mode = get_pd_mode(disaggregation.mode.value)
     if mode is None or mode.router is None:
         return None
-    if mode.router.protocol == PDRouterProtocolEnum.USER_PROVIDED:
+    launch = resolve_router_launch(model, inference_backend)
+    if (
+        mode.router.protocol == PDRouterProtocolEnum.USER_PROVIDED
+        and not launch.command
+    ):
         return None
     return mode.router
 
 
-def managed_router_health_path(model, role_name: Optional[str]) -> Optional[str]:
-    """The path a managed router answers a readiness probe on, per the catalog.
+def managed_router_health_path(
+    model, role_name: Optional[str], inference_backend=None
+) -> Optional[str]:
+    """Read the readiness path from the Router command's owner.
 
-    Needed because a managed router is launched as a custom backend, and a
-    custom backend carries no registered health path -- the generic probe reads
-    that as "nothing to check" and calls the member ready the moment its
-    container exists. The router is the group's only entrance, so that is the
-    one member whose liveness cannot be assumed.
+    Role and backend commands use an explicitly registered backend path when
+    available; otherwise they retain generic readiness. Only a recipe command
+    inherits the recipe executable's health endpoint.
 
     Measured on vllm-router 0.20.2: `/health` answers 200 with "RouterManager
     is healthy". Deliberately NOT `/health_generate`, which answers 503 "No
@@ -274,10 +401,14 @@ def managed_router_health_path(model, role_name: Optional[str]) -> Optional[str]
     correctly -- it counts `regular` workers, and a disaggregated group has
     only `prefill` and `decode` ones.
 
-    Returns None for anything that is not a managed router, and for a recipe
-    that declares no path, leaving the generic behaviour untouched.
+    Returns None when no path is declared for the selected command.
     """
-    router = _managed_router(model, role_name)
+    if role_name != 'router':
+        return None
+    launch = resolve_router_launch(model, inference_backend)
+    if launch.command:
+        return inference_backend.health_check_path if inference_backend else None
+    router = _managed_router(model, role_name, inference_backend)
     return router.health_path if router is not None else None
 
 
@@ -285,6 +416,7 @@ def apply_managed_router(
     model,
     role_name: Optional[str],
     *,
+    inference_backend=None,
     peers: Optional[PeerMap] = None,
     variables: Optional[Mapping[str, object]] = None,
 ):
@@ -298,63 +430,95 @@ def apply_managed_router(
     branch anywhere below this line.
 
     Called at two depths with different information, on purpose. The serve
-    manager asks before the child process exists and passes no peers: all it
-    needs is the backend, which decides the port band and the fallback
-    registry, and rendering a command there would render it from addresses it
-    would then have to re-render. The backend itself asks with peers, and it
-    is the one that has to produce a command that will actually run.
+    manager asks before the child process exists and passes no peers. It needs
+    the backend choice for ports/registry and environment defaults for health
+    checks. Runtime values and the command are rendered by the backend itself
+    once its placement and peers are known.
 
     The result is never persisted — same rule as the projection it extends.
     A router's command holds its peers' addresses, and those change on every
     scale, so storing one would be storing a value that is wrong as soon as
     anything moves.
     """
-    from gpustack.schemas.models import BackendEnum, RoleEffectiveModel, find_role
+    from gpustack.schemas.models import (
+        BackendEnum,
+        RoleEffectiveModel,
+        find_role,
+        role_effective_model,
+    )
+    from gpustack.server.pd_mode_catalog import get_pd_mode
 
-    if not is_managed_router(model, role_name):
+    if not is_managed_router(model, role_name, inference_backend):
         return model
 
     projected = (
         model
         if isinstance(model, RoleEffectiveModel)
-        else RoleEffectiveModel.model_validate(model)
+        else role_effective_model(model, role_name)
     )
     # A router runs a router binary, not an inference engine, so it must not
     # inherit the group's backend — a vLLM-shaped launch would try to serve the
     # model weights from the router's container.
     projected.backend = BackendEnum.CUSTOM
 
+    launch = resolve_router_launch(model, inference_backend)
+    if launch.version:
+        projected.backend_version = launch.version
+    # No engine command or parameters may escape the projection before runtime
+    # rendering, including for recipes without a default Router invocation.
+    projected.run_command = launch.command
+
+    mode = get_pd_mode(model.disaggregation.mode.value)
+    # Resolve defaults for both launch phases and every command source. User
+    # env overrides backend/recipe defaults; only the worker knows runtime values.
+    projected.env = router_environment(
+        model,
+        {
+            **(mode.router.env if not launch.uses_backend_command else {}),
+            **launch.env,
+        },
+    )
     if peers is None or variables is None:
         return projected
-
-    from gpustack.server.pd_mode_catalog import get_pd_mode
+    projected.env = render_values(projected.env, variables)
 
     disaggregation = model.disaggregation
     mode_name = disaggregation.mode.value
-    plan = render_router(get_pd_mode(mode_name), variables, peers)
-    if plan is None:
-        return projected
-
-    # Each half yields to the role independently, and that split is what makes
-    # "bring your own router image" possible without also making the user write
-    # the invocation. The three combinations mean three different things:
-    #
-    #   image only    the binary is somewhere else — today the runner image
-    #                 does not ship `vllm-router` at all — but the catalog
-    #                 still knows how to invoke it
-    #   command only  a hand-written invocation of something already in the
-    #                 engine's runner image
-    #   both          the router is entirely theirs, and `is_managed_router`
-    #                 has already returned False, so this is not reached
     role = find_role(model, role_name)
+    declared = role.backend_parameters if role else None
+    if (
+        mode_name == "vllm-mooncake"
+        and not launch.command
+        and "intra_node_data_parallel_size" in variables
+    ):
+        declared = _static_hybrid_router_parameters(
+            declared, variables["intra_node_data_parallel_size"]
+        )
+    custom_command = launch.command
+    if custom_command:
+        # User templates own every flag. Rendering catalog peer arguments here
+        # would impose its CLI and bootstrap requirements on another binary.
+        router = mode.router
+        plan = RouterPlan(
+            image=render(
+                router.image or "{{runner_image}}", variables, context="router image"
+            ),
+        )
+        projected.run_command = shlex.join(
+            render_router_command_template(
+                custom_command,
+                variables,
+                peers,
+                env=projected.env,
+            )
+        )
+    else:
+        plan = render_router(mode, variables, peers)
+        if plan is None:
+            return projected
+        projected.run_command = shlex.join(plan.command)
     if not (role and role.image_name):
         projected.image_name = plan.image
-    if not (role and role.run_command):
-        # Joined rather than kept as a list because `run_command` is the field
-        # the custom backend reads, and it is a string there. The renderer
-        # produced already-separated tokens, so nothing here has to guess at
-        # quoting.
-        projected.run_command = " ".join(plan.command)
     # Two different things arrive in this field and only one of them belongs
     # to the router.
     #
@@ -371,17 +535,8 @@ def apply_managed_router(
     # platform renders from placement facts are refused at admission instead,
     # because `--prefill` and `--decode` are `action="append"` there and a
     # second one adds a phantom peer rather than replacing the injected one.
-    declared = role.backend_parameters if role else None
     projected.backend_parameters = list(declared) if declared is not None else []
 
-    # Environment goes the other way round from image and command: the
-    # catalog's entries are what the binary needs in order to come up at all,
-    # so they are defaults the deployment may override rather than values that
-    # yield wholesale to the role. Merged under, not over — a user who sets
-    # one of these names has said something specific and keeps it, while the
-    # rest still arrive.
-    if plan.env:
-        projected.env = {**plan.env, **(projected.env or {})}
     return projected
 
 
@@ -401,32 +556,13 @@ def group_peer_addresses(
     unchanged command — otherwise every reconcile would look like a spec change
     to anything comparing commands.
     """
-    from gpustack.schemas.models import ModelInstanceStateEnum
+    from gpustack.utils.pd_router_membership import active_router_peers
 
     peers: Dict[str, List[PeerAddress]] = {}
-    for instance in instances:
-        role = getattr(instance, "role", None)
-        if not role or getattr(instance, "group_id", None) != group_id:
-            continue
-        if getattr(instance, "state", None) != ModelInstanceStateEnum.RUNNING:
-            # Only running members have had their ports assigned; an address
-            # taken from a member that has not started yet is a placeholder,
-            # and the router would carry it for the rest of its life.
-            continue
-        ip = worker_ip_by_id.get(getattr(instance, "worker_id", None))
-        port = getattr(instance, "port", None)
-        if not ip or not port:
-            continue
-        # Bands, not points: a peer flag needs the base, and carrying the whole
-        # band here would put a width into an address. Absent on a member that
-        # declares none, which is most of them.
-        bands = getattr(instance, "named_ports", None) or {}
-        named = {
-            name: band.base
-            for name, band in bands.items()
-            if getattr(band, "base", None) is not None
-        }
-        peers.setdefault(role, []).append(PeerAddress(ip, int(port), named))
+    for instance, ip, port, named in active_router_peers(
+        instances, group_id, worker_ip_by_id
+    ):
+        peers.setdefault(instance.role, []).append(PeerAddress(ip, port, named))
 
     for role in peers:
         # By address only. The named ports are a mapping and would not compare,

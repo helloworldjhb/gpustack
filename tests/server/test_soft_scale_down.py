@@ -19,7 +19,14 @@ import sqlalchemy as sa
 from sqlmodel import SQLModel
 
 from gpustack.schemas.common import UTCDateTime
-from gpustack.schemas.models import ModelInstance, ModelInstanceStateEnum, RoleNameEnum
+from gpustack.schemas.models import (
+    Model,
+    ModelInstance,
+    ModelInstanceStateEnum,
+    RoleNameEnum,
+    RoleSpec,
+    SourceEnum,
+)
 from gpustack.server import pd_membership
 from gpustack.server.controllers import (
     _next_drain_due,
@@ -41,16 +48,19 @@ def _instance(name, role="prefill", draining_since=None, worker_id=1):
         port=40000,
         state=ModelInstanceStateEnum.RUNNING,
         draining_since=draining_since,
+        distributed_servers=None,
     )
     instance.update = AsyncMock()
     return instance
 
 
 def _model(roles=("prefill", "decode")):
-    return SimpleNamespace(
+    return Model(
         id=1,
         name="m",
-        roles=[SimpleNamespace(name=name) for name in roles],
+        source=SourceEnum.HUGGING_FACE,
+        huggingface_repo_id='org/repo',
+        roles=[RoleSpec(name=name) for name in roles],
     )
 
 
@@ -68,7 +78,7 @@ class TestRegistryRemoval:
 
         members = pd_membership.desired_members(_model(), [keep, going])
 
-        assert members == {pd_membership.member_url(keep): "prefill"}
+        assert members == {f"http://{keep.worker_ip}:{keep.port}": "prefill"}
 
     def test_it_is_not_a_state_change(self):
         """The container must keep serving the decodes already pulling from
@@ -84,6 +94,10 @@ class TestPicking:
     ):
         picked = candidates if candidates is not None else have
         with (
+            patch(
+                "gpustack.server.controllers.Model.one_by_id",
+                AsyncMock(return_value=model),
+            ),
             patch("gpustack.envs.SCHEDULER_DRAIN_WINDOW_SECONDS", window),
             patch(
                 "gpustack.server.controllers.find_scale_down_candidates",
@@ -339,5 +353,33 @@ async def test_cancelling_a_drain_puts_it_back():
 
     assert instance.draining_since is None
     assert pd_membership.desired_members(_model(), [instance]) == {
-        pd_membership.member_url(instance): RoleNameEnum.PREFILL.value
+        f"http://{instance.worker_ip}:{instance.port}": RoleNameEnum.PREFILL.value
     }
+
+
+@pytest.mark.parametrize('managed', [False, True])
+def test_elapsed_stop_barrier_schedules_release_then_waits_for_worker_reports(managed):
+    from uuid import uuid4
+    from gpustack.schemas.models import DistributedServers, ModelInstanceLegacyStop
+
+    instance = _instance(
+        'guarded', draining_since=datetime.now(timezone.utc) - timedelta(days=2)
+    )
+    instance.distributed_servers = DistributedServers(
+        workloads=[] if managed else None,
+        legacy_stop=(
+            None
+            if managed
+            else ModelInstanceLegacyStop(
+                token=uuid4(),
+                restart_count=0,
+                worker_ids=[1],
+                worker_principal_ids={1: 10},
+            )
+        ),
+    )
+    # An unreleased managed drain must authorize physical stopping first.
+    assert _next_drain_due([instance]) == (0.0 if managed else None)
+    if managed:
+        instance.distributed_servers.stop_requested = True
+        assert _next_drain_due([instance]) is None

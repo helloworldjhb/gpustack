@@ -300,6 +300,7 @@ class _Collection:
         upstream_instances=None,
         allow_trend_lookback=False,
         query_interval=None,
+        summary_only=False,
     ):
         self.model = model
         self.instances = {instance.id: instance for instance in instances}
@@ -317,6 +318,7 @@ class _Collection:
         self.statistics = [s for s in HISTOGRAM_STATISTICS if s in statistics]
         self.allow_trend_lookback = allow_trend_lookback
         self.query_interval = query_interval
+        self.summary_only = summary_only
         self.slots = asyncio.Semaphore(8)
         self.completed = set()
         self.reads = {}
@@ -332,6 +334,8 @@ class _Collection:
         return await self.reads[key]
 
     async def read_native(self, query, *, ranged=False):
+        if ranged and self.summary_only:
+            return []
         async with self.slots:
             if ranged:
                 start, end = (
@@ -1061,6 +1065,9 @@ async def collect_model_metrics(
     allow_trend_lookback: bool = False,
     query_step: Optional[int] = None,
     query_interval: Optional[MonitoringInterval] = None,
+    query_rate_window_seconds: Optional[int] = None,
+    summary_only: bool = False,
+    source_not_before: Optional[float] = None,
     ingress_context: str = 'deployment',
 ) -> ModelMetrics:
     """Collect guarded runtime observations for an already authorized population.
@@ -1101,7 +1108,11 @@ async def collect_model_metrics(
         start=start,
         end=end,
         step=query_step if query_step is not None else step,
-        rate_window_seconds=time_policy.rate_window(step),
+        rate_window_seconds=(
+            query_rate_window_seconds
+            if query_rate_window_seconds is not None
+            else time_policy.rate_window(step)
+        ),
         last_refreshed_at=end,
         history_scope=_HISTORY_SCOPE,
     )
@@ -1130,6 +1141,7 @@ async def collect_model_metrics(
             upstream_instances,
             allow_trend_lookback,
             query_interval,
+            summary_only,
         )
         for definition in definitions:
             roles, status, reason = _observation_roles(
@@ -1181,7 +1193,15 @@ async def collect_model_metrics(
                 view,
                 launches,
                 source_identities,
-                interval.start if source_identities else None,
+                (
+                    (
+                        source_not_before
+                        if source_not_before is not None
+                        else interval.start
+                    )
+                    if source_identities
+                    else None
+                ),
             )
             fills.append((definition, metric, scope))
             scheduled.add(definition.key)

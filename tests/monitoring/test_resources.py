@@ -9,6 +9,89 @@ from tests.monitoring.test_hardware import _worker, _context, _instance
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'seconds,fixed,step',
+    [
+        (15, True, 1),
+        (273, True, 2),
+        (3600, True, 15),
+        (604800, True, 2520),
+        (300, False, 15),
+    ],
+)
+async def test_fixed_hardware_inspection_is_detailed_without_changing_relative_grids(
+    monkeypatch, seconds, fixed, step
+):
+    from gpustack.monitoring import resources
+
+    end = 1700000000
+    monkeypatch.setattr(resources.time, 'time', lambda: end)
+    monkeypatch.setattr(
+        resources.hardware.prometheus_query, 'prometheus_url', lambda: 'http://prom'
+    )
+    collect = AsyncMock()
+    monkeypatch.setattr(resources.hardware, '_collect_all_history', collect)
+    response = await resources.collect_resource_metrics(
+        _worker(),
+        [],
+        window_seconds=seconds,
+        start=end - seconds if fixed else None,
+        end=end if fixed else None,
+        client=object(),
+    )
+    assert response.step == step
+    assert collect.await_args.args[2].step == step
+    assert seconds / step <= 240
+
+
+@pytest.mark.asyncio
+async def test_short_hardware_inspection_retains_a_brief_cpu_peak(monkeypatch):
+    import math
+    from gpustack.monitoring import resources
+
+    worker = _worker()
+    labels = resources.hardware._worker_identity(worker)
+    monkeypatch.setattr(
+        resources.hardware.prometheus_query, 'prometheus_url', lambda: 'http://prom'
+    )
+
+    def value(at):
+        return '80' if 1006 <= at < 1010 else '20'
+
+    async def ranged(client, url, query, start, end, step):
+        if 'worker_host_cpu_utilization_percent' not in query:
+            return []
+        return [
+            {
+                'metric': labels,
+                'values': [
+                    [at, value(at)]
+                    for at in (
+                        start + i * step
+                        for i in range(math.floor((end - start) / step) + 1)
+                    )
+                ],
+            }
+        ]
+
+    async def instant(client, url, query, at):
+        return (
+            [{'metric': labels, 'value': [at, value(at)]}]
+            if 'worker_host_cpu_utilization_percent' in query
+            else []
+        )
+
+    monkeypatch.setattr(resources.hardware.prometheus_query, 'query_range', ranged)
+    monkeypatch.setattr(resources.hardware.prometheus_query, 'query_instant', instant)
+    result = await resources.collect_resource_metrics(
+        worker, [], window_seconds=20, start=1000, end=1020, client=object()
+    )
+    points = result.metrics['host_cpu'].series[0].points
+    assert max(value for _, value in points if value is not None) == 80
+    assert all(1000 <= at < 1020 for at, _ in points)
+
+
+@pytest.mark.asyncio
 async def test_direct_worker_denies_foreign_owner_before_prometheus(monkeypatch):
     from gpustack.routes import resource_monitoring as routes
 

@@ -1,10 +1,13 @@
 from sqlmodel import col
+import asyncio
 import math
 import re
+import time
 import yaml
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Dict, List, Optional, Sequence
 from urllib.parse import urlparse
+from uuid import uuid4
 import aiohttp
 from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import (
@@ -20,6 +23,9 @@ from gpustack.api.exceptions import (
     InternalServerErrorException,
     NotFoundException,
     BadRequestException,
+    ConflictException,
+    ForbiddenException,
+    HTTPException,
 )
 from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack.api.tenant import (
@@ -49,7 +55,12 @@ from gpustack.schemas.model_routes import (
     TargetStateEnum,
     effective_route_name,
 )
-from gpustack.schemas.principals import Principal, platform_principal_id
+from gpustack.schemas.principals import (
+    OrgRole,
+    Principal,
+    PrincipalType,
+    platform_principal_id,
+)
 from gpustack.schemas.workers import Worker
 from gpustack.config.config import get_global_config
 from gpustack.routes.clusters import get_server_url
@@ -98,7 +109,20 @@ from gpustack.schemas.benchmark_monitoring import (
     BenchmarkModelMetrics,
     BenchmarkMonitoringContext,
     BenchmarkResourceMetrics,
+    BenchmarkObservationStorage,
+    BenchmarkArchiveQueryCapabilities,
 )
+from gpustack.monitoring.archive import (
+    archive_status,
+    enqueue_archive_deletion,
+    ensure_archive_for_benchmark,
+    read_archive_context,
+    read_archive_metrics,
+    read_archive_phase_observations,
+    read_archive_resources,
+    retry_archive,
+)
+from gpustack.server.benchmark_run_identity import assert_benchmark_run
 from gpustack.schemas.model_metrics import MetricRole, MetricSection, MetricView
 from gpustack.monitoring.benchmarks import (
     capture_benchmark_run,
@@ -368,21 +392,110 @@ async def get_benchmark(
     return benchmark
 
 
+async def _monitoring_benchmark(session, ctx, id):
+    if ctx is None or getattr(ctx.user, 'kind', None) == PrincipalType.SYSTEM:
+        raise ForbiddenException(
+            message='Benchmark monitoring requires a user principal'
+        )
+    ctx.assert_org_role(OrgRole.OWNER)
+    benchmark = await Benchmark.one_by_id(session, id)
+    assert_resource_visible(ctx, benchmark, not_found_message='Benchmark not found')
+    return benchmark
+
+
+def _prefer_archive(benchmark, revision, run_id=None):
+    if run_id is not None and run_id != benchmark.run_id:
+        return True
+    return revision is not None or benchmark.state not in (
+        BenchmarkStateEnum.PENDING,
+        BenchmarkStateEnum.QUEUED,
+        BenchmarkStateEnum.RUNNING,
+    )
+
+
+def _assert_live_pin(benchmark, run_id, revision):
+    if revision is not None:
+        raise ConflictException(
+            message='Benchmark archive revision is unavailable; reload context',
+            details={'code': 'archive_revision_unavailable'},
+        )
+    if run_id is not None:
+        assert_benchmark_run(benchmark, run_id)
+
+
+def _archive_enabled():
+    config = get_global_config()
+    return (
+        config is not None
+        and getattr(config, 'artifact_storage_mode', 'disabled') != 'disabled'
+    )
+
+
+def _live_observation(response, benchmark, state=None):
+    if benchmark.run_id is not None:
+        response.observation_storage = BenchmarkObservationStorage(
+            source='live',
+            run_id=benchmark.run_id,
+            archive_revision=None,
+            archive_state=(
+                (state or {}).get(
+                    'state',
+                    (
+                        'capturing'
+                        if benchmark.state == BenchmarkStateEnum.RUNNING
+                        else 'not_archived'
+                    ),
+                )
+                if _archive_enabled()
+                else 'disabled'
+            ),
+            captured_until=(state or {}).get('captured_until'),
+            last_error=(state or {}).get('last_error'),
+        )
+        response.query_capabilities = BenchmarkArchiveQueryCapabilities(
+            custom_range_trends=True,
+            custom_range_summary=True,
+            arbitrary_subset_summary=True,
+        )
+    return response
+
+
 @router.get('/{id}/monitoring', response_model=BenchmarkMonitoringContext)
 async def get_benchmark_monitoring(
     request: Request,
     session: SessionDep,
     ctx: TenantContextDep,
     id: int,
+    run_id: Optional[str] = None,
+    archive_revision: Annotated[Optional[int], Query(ge=1)] = None,
 ):
     """Actual phase windows and independently authorized run associations."""
+    benchmark = await _monitoring_benchmark(session, ctx, id)
+    if _prefer_archive(benchmark, archive_revision, run_id):
+        archived = await read_archive_context(
+            session, ctx, benchmark, run_id=run_id, revision=archive_revision
+        )
+        if archived is not None:
+            return archived
+    _assert_live_pin(benchmark, run_id, archive_revision)
     history = await load_benchmark_history(
         session,
         ctx,
         id,
         client=getattr(request.app.state, 'http_client_no_proxy', None),
     )
-    return history.context
+    if not history.context.available and not _prefer_archive(
+        benchmark, archive_revision, run_id
+    ):
+        archived = await read_archive_context(session, ctx, benchmark, run_id=run_id)
+        if archived is not None:
+            return archived
+    state = (
+        await archive_status(session, ctx, benchmark, run_id=run_id)
+        if benchmark.run_id is not None and _archive_enabled()
+        else None
+    )
+    return _live_observation(history.context, benchmark, state)
 
 
 @router.get('/{id}/metrics', response_model=BenchmarkModelMetrics)
@@ -402,11 +515,33 @@ async def get_benchmark_model_metrics(
         Query(pattern=r'^(avg|p50|p95|p99)(,(avg|p50|p95|p99)){0,3}$'),
     ] = 'avg,p50,p95,p99',
     section: MetricSection = 'all',
+    run_id: Optional[str] = None,
+    archive_revision: Annotated[Optional[int], Query(ge=1)] = None,
 ):
     """Normalized engine observations for the recorded benchmark population."""
+    benchmark = await _monitoring_benchmark(session, ctx, id)
+    if _prefer_archive(benchmark, archive_revision, run_id):
+        archived = await read_archive_metrics(
+            session,
+            ctx,
+            benchmark,
+            phase_id=phase_id,
+            start=start,
+            end=end,
+            instance_ids=instance_ids,
+            role=role,
+            view=view,
+            statistic=statistic,
+            section=section,
+            run_id=run_id,
+            revision=archive_revision,
+        )
+        if archived is not None:
+            return archived
+    _assert_live_pin(benchmark, run_id, archive_revision)
     client = getattr(request.app.state, 'http_client_no_proxy', None)
     history = await load_benchmark_history(session, ctx, id, client=client)
-    return await collect_benchmark_model_metrics(
+    response = await collect_benchmark_model_metrics(
         history,
         phase_id=phase_id,
         start=start,
@@ -418,6 +553,7 @@ async def get_benchmark_model_metrics(
         section=section,
         client=client,
     )
+    return _live_observation(response, benchmark)
 
 
 @router.get('/{id}/resource-metrics', response_model=BenchmarkResourceMetrics)
@@ -429,17 +565,136 @@ async def get_benchmark_resource_metrics(
     phase_id: Optional[str] = None,
     start: Optional[float] = None,
     end: Optional[float] = None,
+    run_id: Optional[str] = None,
+    archive_revision: Annotated[Optional[int], Query(ge=1)] = None,
 ):
     """Every visible captured GPU and Worker over the measured interval."""
+    benchmark = await _monitoring_benchmark(session, ctx, id)
+    if _prefer_archive(benchmark, archive_revision, run_id):
+        archived = await read_archive_resources(
+            session,
+            ctx,
+            benchmark,
+            phase_id=phase_id,
+            start=start,
+            end=end,
+            run_id=run_id,
+            revision=archive_revision,
+        )
+        if archived is not None:
+            return archived
+    _assert_live_pin(benchmark, run_id, archive_revision)
     client = getattr(request.app.state, 'http_client_no_proxy', None)
     history = await load_benchmark_history(session, ctx, id, client=client)
-    return await collect_benchmark_resource_metrics(
+    response = await collect_benchmark_resource_metrics(
         history,
         phase_id=phase_id,
         start=start,
         end=end,
         client=client,
     )
+    return _live_observation(response, benchmark)
+
+
+def _phase_ids(value):
+    if value is None:
+        return None
+    phases = list(dict.fromkeys(value.split(',')))
+    if not phases or len(phases) > 50 or any(not p or len(p) > 100 for p in phases):
+        raise BadRequestException(message='Provide between 1 and 50 phase IDs')
+    return phases
+
+
+def _without_series(response):
+    for metric in response.metrics.values():
+        metric.series = []
+    return response
+
+
+@router.get('/{id}/phase-observations')
+async def get_benchmark_phase_observations(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+    phase_ids: Annotated[Optional[str], Query(max_length=5050)] = None,
+    run_id: Optional[str] = None,
+    archive_revision: Annotated[Optional[int], Query(ge=1)] = None,
+):
+    """Batch exact measured-phase summaries without transferring full curves."""
+    benchmark = await _monitoring_benchmark(session, ctx, id)
+    selected = _phase_ids(phase_ids)
+    if _prefer_archive(benchmark, archive_revision, run_id):
+        archived = await read_archive_phase_observations(
+            session,
+            ctx,
+            benchmark,
+            phase_ids=selected,
+            run_id=run_id,
+            revision=archive_revision,
+        )
+        if archived is not None:
+            return archived
+    _assert_live_pin(benchmark, run_id, archive_revision)
+    client = getattr(request.app.state, 'http_client_no_proxy', None)
+    history = await load_benchmark_history(session, ctx, id, client=client)
+    phases = {phase.id: phase for phase in history.context.stages}
+    selected = selected if selected is not None else list(phases)
+    if len(selected) > 50:
+        raise BadRequestException(
+            message='Request at most 50 measured phases per batch'
+        )
+    if any(phase not in phases for phase in selected):
+        raise NotFoundException(message='Benchmark phase not found')
+    semaphore = asyncio.Semaphore(3)
+
+    async def observe(phase_id):
+        async with semaphore:
+            runtime = await collect_benchmark_model_metrics(
+                history, phase_id=phase_id, view='instances', client=client
+            )
+            resources = await collect_benchmark_resource_metrics(
+                history, phase_id=phase_id, client=client
+            )
+            return phase_id, {
+                'runtime': _live_observation(_without_series(runtime), benchmark),
+                'resources': _live_observation(_without_series(resources), benchmark),
+            }
+
+    return {
+        'run_id': benchmark.run_id,
+        'archive_revision': None,
+        'phases': dict(await asyncio.gather(*(observe(p) for p in selected))),
+    }
+
+
+@router.get('/{id}/monitoring-archive')
+async def get_benchmark_monitoring_archive(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+    run_id: Optional[str] = None,
+    archive_revision: Annotated[Optional[int], Query(ge=1)] = None,
+):
+    benchmark = await _monitoring_benchmark(session, ctx, id)
+    return await archive_status(
+        session, ctx, benchmark, run_id=run_id, revision=archive_revision
+    )
+
+
+@router.post('/{id}/monitoring-archive/retry')
+async def retry_benchmark_monitoring_archive(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+    body: Optional[Dict[str, str]] = None,
+    run_id: Optional[str] = None,
+):
+    benchmark = await _monitoring_benchmark(session, ctx, id)
+    submitted = (body or {}).get('run_id', run_id)
+    if run_id is not None and submitted != run_id:
+        raise BadRequestException(message='Conflicting Benchmark execution IDs')
+    return await retry_archive(session, ctx, benchmark, run_id=submitted)
 
 
 # How far either side of a run the dashboard window is opened. A run's row is
@@ -1205,6 +1460,7 @@ async def validate_and_mutate_benchmark_in(  # noqa: C901
     # row is visible to the owning Org via cluster_resource_visibility.
     mutated.cluster_id = instance.cluster_id
     mutated.owner_principal_id = instance.owner_principal_id
+    mutated.run_id = str(uuid4())
     return mutated
 
 
@@ -1264,9 +1520,18 @@ async def update_benchmark_state(
     ctx: TenantContextDep,
     id: int,
     state_update: BenchmarkStateUpdate,
+    run_id: Optional[str] = None,
 ):
-    benchmark = await Benchmark.one_by_id(session, id)
+    benchmark = await Benchmark.one_by_id(session, id, for_update=True)
     assert_resource_visible(ctx, benchmark, not_found_message="Benchmark not found")
+    submitted = state_update.run_id if state_update.run_id is not None else run_id
+    if run_id is not None and state_update.run_id not in (None, run_id):
+        raise BadRequestException(message='Conflicting Benchmark execution IDs')
+    user_stop = (
+        state_update.state == BenchmarkStateEnum.STOPPED
+        and getattr(ctx.user, 'kind', None) != PrincipalType.SYSTEM
+    )
+    assert_benchmark_run(benchmark, submitted, allow_unscoped=user_stop)
 
     if (
         state_update.state is not None
@@ -1285,7 +1550,27 @@ async def update_benchmark_state(
     apply_progress_invariant(state_update, benchmark)
 
     try:
-        source = state_update.model_dump(exclude_unset=True)
+        source = state_update.model_dump(exclude_unset=True, exclude={'run_id'})
+        if (
+            state_update.state == BenchmarkStateEnum.PENDING
+            and benchmark.state
+            not in (
+                BenchmarkStateEnum.PENDING,
+                BenchmarkStateEnum.QUEUED,
+                BenchmarkStateEnum.RUNNING,
+            )
+        ):
+            await ensure_archive_for_benchmark(session, benchmark)
+            source['run_id'] = str(uuid4())
+            source['progress'] = 0
+            source['pid'] = None
+            source['validity'] = None
+            source.update(BenchmarkMetrics().model_dump())
+            for field in ('peak_rate', 'slo_met_rate', 'recommended_rate'):
+                source[field] = None
+            rows = await BenchmarkResult.all_by_field(session, 'benchmark_id', id)
+            for row in rows:
+                await row.delete(session, auto_commit=False)
         if state_update.state is not None:
             snapshot = await verify_benchmark_run(
                 benchmark,
@@ -1293,8 +1578,35 @@ async def update_benchmark_state(
                 confirm=state_update.state == BenchmarkStateEnum.RUNNING,
             )
             if snapshot is not None:
+                if 'run_id' in source and snapshot.monitoring is not None:
+                    if any(
+                        e.kind == 'generation_changed'
+                        for e in snapshot.monitoring.events
+                    ):
+                        raise ConflictException(
+                            message=(
+                                'Benchmark target changed; create a new Benchmark '
+                                'for this deployment.'
+                            )
+                        )
+                    snapshot = snapshot.model_copy(
+                        update={
+                            'monitoring': snapshot.monitoring.model_copy(
+                                update={
+                                    'captured_at': time.time(),
+                                    'confirmed_at': None,
+                                    'events': [],
+                                }
+                            )
+                        }
+                    )
                 source['snapshot'] = snapshot
-        await benchmark.update(session, source)
+        await benchmark.update(session, source, auto_commit=False)
+        await ensure_archive_for_benchmark(session, benchmark)
+        await session.commit()
+    except HTTPException:
+        await session.rollback()
+        raise
     except Exception as e:
         raise InternalServerErrorException(
             message=f"Failed to update benchmark state: {e}"
@@ -1438,10 +1750,15 @@ async def get_benchmark_snapshot(
     response_model=BenchmarkPublic,
 )
 async def update_benchmark_metrics(
-    session: SessionDep, ctx: TenantContextDep, id: int, metrics: BenchmarkMetrics
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+    metrics: BenchmarkMetrics,
+    run_id: Optional[str] = None,
 ):
-    benchmark = await Benchmark.one_by_id(session, id)
+    benchmark = await Benchmark.one_by_id(session, id, for_update=True)
     assert_resource_visible(ctx, benchmark, not_found_message="Benchmark not found")
+    assert_benchmark_run(benchmark, run_id)
     try:
         await benchmark.update(session, metrics)
     except Exception as e:
@@ -1461,6 +1778,7 @@ async def update_benchmark_results(
     ctx: TenantContextDep,
     id: int,
     results: List[BenchmarkResultCreate],
+    run_id: Optional[str] = None,
 ):
     """
     Replace the benchmark's per-point results (one row per (input_tokens, rate)
@@ -1472,8 +1790,9 @@ async def update_benchmark_results(
     comes from the path here, and `id` / timestamps / `deleted_at` stay the
     server's to assign.
     """
-    benchmark = await Benchmark.one_by_id(session, id)
+    benchmark = await Benchmark.one_by_id(session, id, for_update=True)
     assert_resource_visible(ctx, benchmark, not_found_message="Benchmark not found")
+    assert_benchmark_run(benchmark, run_id)
     if len(results) > MAX_BENCHMARK_RESULT_POINTS:
         raise BadRequestException(
             message=(
@@ -1494,6 +1813,7 @@ async def update_benchmark_results(
                 source={**data.model_dump(), "benchmark_id": id},
                 auto_commit=False,
             )
+        await ensure_archive_for_benchmark(session, benchmark, results=results)
         await session.commit()
     except Exception as e:
         await session.rollback()
@@ -1561,6 +1881,7 @@ async def delete_benchmark(session: SessionDep, ctx: TenantContextDep, id: int):
     assert_resource_visible(ctx, benchmark, not_found_message="Benchmark not found")
 
     try:
+        await enqueue_archive_deletion(session, benchmark)
         await benchmark.delete(session)
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to delete benchmark: {e}")
@@ -1655,6 +1976,7 @@ async def export_benchmarks(
 
     exclude_fields = [
         "id",
+        "run_id",
         "cluster_id",
         "owner_principal_id",
         "model_id",
